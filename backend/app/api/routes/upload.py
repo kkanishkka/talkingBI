@@ -16,7 +16,7 @@ def _load_dataframe(file: UploadFile) -> pd.DataFrame:
     file_bytes = file.file.read()
 
     if ext == "csv":
-        return pd.read_csv(io.BytesIO(file_bytes))
+        return pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
 
     if ext in {"xlsx", "xls"}:
         return pd.read_excel(io.BytesIO(file_bytes))

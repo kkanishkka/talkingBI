@@ -1,14 +1,14 @@
-// src/App.jsx — TalkingBI dynamic dashboard
+// src/App.jsx — TalkingBI dynamic dashboard (improved)
 import { useState } from "react";
-import FileUpload       from "./components/FileUpload";
-import PromptBar        from "./components/PromptBar";
-import InsightCard      from "./components/InsightCard";
-import ExecutiveSummary from "./components/ExecutiveSummary";
-import DatasetProfile   from "./components/DatasetProfile";
+import FileUpload        from "./components/FileUpload";
+import PromptBar         from "./components/PromptBar";
+import ExecutiveSummary  from "./components/ExecutiveSummary";
+import DatasetProfile    from "./components/DatasetProfile";
 import VisualizationGrid from "./components/VisualizationGrid";
-import LoadingSpinner   from "./components/LoadingSpinner";
+import InsightCard       from "./components/InsightCard";
+import LoadingSpinner    from "./components/LoadingSpinner";
 import { generateDashboard } from "./services/api";
-import "./App.css";
+
 
 export default function App() {
   const [file,    setFile]    = useState(null);
@@ -23,23 +23,21 @@ export default function App() {
     setError(null);
     setData(null);
     try {
-      const result = await generateDashboard(file, prompt || undefined);
+      const result = await generateDashboard(file, prompt);
       setData(result);
     } catch (err) {
-      setError(err.message || "Failed to generate dashboard. Please try again.");
+      setError(err.message || "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
-  const priorityOrder = { high: 0, medium: 1, low: 2 };
-  const sortedInsights = data?.insights
-    ? [...data.insights].sort(
-        (a, b) =>
-          (priorityOrder[a.priority?.toLowerCase()] ?? 9) -
-          (priorityOrder[b.priority?.toLowerCase()] ?? 9)
-      )
-    : [];
+  const handleReset = () => {
+    setFile(null);
+    setPrompt("");
+    setData(null);
+    setError(null);
+  };
 
   return (
     <div className="app">
@@ -47,94 +45,105 @@ export default function App() {
       <header className="header">
         <div className="header-inner">
           <div className="logo">
-            <span className="logo-mark">◈</span>
+            <span className="brand-icon">◈</span>
             <span className="logo-text">TalkingBI</span>
           </div>
-          <span className="header-tag">AI-Powered BI Dashboard</span>
+          <p className="header-tag">AI-powered Business Intelligence Dashboard</p>
         </div>
       </header>
 
-      <main className="main">
-
-        {/* ── 01 Upload + Prompt ── */}
-        <section className="upload-section">
-          <div className="section-label">01 — DATA SOURCE</div>
-          <h2 className="section-title">Upload your dataset</h2>
-          <p className="section-sub">
-            CSV or Excel. Add an optional natural-language goal to guide the analysis.
-          </p>
-
-          <div className="upload-row" style={{ flexWrap: "wrap", gap: 12 }}>
-            <FileUpload file={file} onFileSelect={setFile} />
-            <PromptBar value={prompt} onChange={setPrompt} disabled={loading} />
-            <button
-              className="btn-generate"
-              onClick={handleGenerate}
-              disabled={!file || loading}
-            >
-              {loading ? "Analysing…" : "Generate Dashboard →"}
-            </button>
-          </div>
-
-          {error && (
-            <div className="error-banner">
-              <span className="error-icon">⚠</span> {error}
+      {/* ── Upload + Prompt Panel ── */}
+      <main className="app-main">
+        {!data && !loading && (
+          <section className="upload-section">
+            <div className="upload-card">
+              <h2 className="upload-title">Upload your dataset</h2>
+              <p className="upload-subtitle">
+                CSV or Excel — any schema, any industry. TalkingBI adapts automatically.
+              </p>
+              <FileUpload file={file} onFileChange={setFile} />
+              <PromptBar
+                prompt={prompt}
+                onPromptChange={setPrompt}
+                onGenerate={handleGenerate}
+                disabled={!file || loading}
+              />
+              {error && (
+                <div className="error-banner" role="alert">
+                  <span className="error-icon">⚠</span>
+                  <span>{error}</span>
+                </div>
+              )}
             </div>
-          )}
-        </section>
+          </section>
+        )}
 
         {/* ── Loading ── */}
         {loading && <LoadingSpinner />}
 
-        {/* ── Results ── */}
+        {/* ── Dashboard Output ── */}
         {data && !loading && (
-          <>
-            {/* 02 — Dataset Profile */}
+          <div className="dashboard-output">
+            {/* top action bar */}
+            <div className="dashboard-topbar">
+              <div className="topbar-left">
+                <span className="dash-icon">◈</span>
+                <h2 className="dash-title">Dashboard</h2>
+                {data.dataset_profile && (
+                  <span className="dash-meta">
+                    {data.dataset_profile.rows?.toLocaleString()} rows ·{" "}
+                    {data.dataset_profile.columns} columns
+                  </span>
+                )}
+              </div>
+              <button className="btn-reset" onClick={handleReset}>
+                ← New Dataset
+              </button>
+            </div>
+
+            {/* executive summary */}
+            {data.executive_summary?.length > 0 && (
+              <ExecutiveSummary bullets={data.executive_summary} />
+            )}
+
+            {/* dataset profile */}
             {data.dataset_profile && (
-              <section className="result-section">
-                <div className="section-label">02 — DATASET PROFILE</div>
-                <DatasetProfile profile={data.dataset_profile} />
-              </section>
+              <DatasetProfile profile={data.dataset_profile} />
             )}
 
-            {/* 03 — Executive Summary */}
-            <section className="result-section">
-              <div className="section-label">03 — EXECUTIVE SUMMARY</div>
-              <ExecutiveSummary summary={data.executive_summary} />
-            </section>
-
-            {/* 04 — Visualizations */}
-            {data.visualizations?.length > 0 && (
-              <section className="result-section">
-                <div className="section-label">
-                  04 — VISUALIZATIONS
-                  <span className="insight-count">{data.visualizations.length} charts</span>
-                </div>
-                <VisualizationGrid visualizations={data.visualizations} />
-              </section>
+            {/* visualizations */}
+            {data.visualizations?.length > 0 ? (
+              <VisualizationGrid visualizations={data.visualizations} />
+            ) : (
+              <div className="empty-state">
+                <span className="empty-icon">📊</span>
+                <p>No visualizations could be generated for this dataset.</p>
+              </div>
             )}
 
-            {/* 05 — Insights */}
-            {sortedInsights.length > 0 && (
-              <section className="result-section">
-                <div className="section-label">
-                  05 — INSIGHTS
-                  <span className="insight-count">{sortedInsights.length} findings</span>
-                </div>
+            {/* insights */}
+            {data.insights?.length > 0 && (
+              <section className="insights-section">
+                <h3 className="section-heading">
+                  <span className="section-icon">🔍</span> Data Insights
+                </h3>
                 <div className="insights-grid">
-                  {sortedInsights.map((ins, i) => (
-                    <InsightCard key={i} insight={ins} index={i} />
+                  {data.insights.map((insight, i) => (
+                    <InsightCard key={i} insight={insight} />
                   ))}
                 </div>
               </section>
             )}
-          </>
+
+            {error && (
+              <div className="error-banner" role="alert">
+                <span className="error-icon">⚠</span>
+                <span>{error}</span>
+              </div>
+            )}
+          </div>
         )}
       </main>
-
-      <footer className="footer">
-        TalkingBI · Powered by AI · {new Date().getFullYear()}
-      </footer>
     </div>
   );
 }

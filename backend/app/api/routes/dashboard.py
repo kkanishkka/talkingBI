@@ -13,8 +13,10 @@ Single combined endpoint that:
 No existing service is rewritten — this router is the only new file.
 ────────────────────────────────────────────────────────────────────
 """
+
 from __future__ import annotations
 
+#from curses import raw
 import io
 from typing import Any
 
@@ -37,7 +39,7 @@ def _load_dataframe(file: UploadFile) -> pd.DataFrame:
     ext = filename.lower().rsplit(".", 1)[-1]
     raw = file.file.read()
     if ext == "csv":
-        return pd.read_csv(io.BytesIO(raw))
+        return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
     if ext in {"xlsx", "xls"}:
         return pd.read_excel(io.BytesIO(raw))
     raise HTTPException(

@@ -1,28 +1,75 @@
 // src/components/InsightCard.jsx
-export default function InsightCard({ insight, index }) {
-  const { title, insight_text, category, priority = "medium" } = insight;
+// Renders a single data insight with priority border, bold-text support,
+// evidence field tags, and a visual confidence bar.
 
-  const priorityClass = {
-    high:   "priority-high",
-    medium: "priority-medium",
-    low:    "priority-low",
-  }[priority.toLowerCase()] || "priority-medium";
+/**
+ * Parses **bold** markers into React strong nodes.
+ */
+function parseBold(text) {
+  if (!text || typeof text !== "string") return text;
+  const parts = text.split(/\*\*(.*?)\*\*/g);
+  return parts.map((part, i) =>
+    i % 2 === 1 ? <strong key={i}>{part}</strong> : part
+  );
+}
+
+const CATEGORY_LABELS = {
+  distribution:  "Distribution",
+  descriptive:   "Descriptive",
+  trend:         "Trend",
+  data_quality:  "Data Quality",
+  structural:    "Structure",
+  relationship:  "Relationship",
+};
+
+export default function InsightCard({ insight }) {
+  if (!insight) return null;
+
+  const {
+    title = "Insight",
+    insight_text = "",
+    category = "descriptive",
+    priority = "medium",
+    evidence_fields = [],
+    confidence = 0.75,
+  } = insight;
+
+  const categoryLabel = CATEGORY_LABELS[category] || category;
+  const confPct = Math.round((confidence || 0.75) * 100);
 
   return (
-    <div
-      className="insight-card"
-      style={{ animationDelay: `${index * 60}ms` }}
-    >
-      <div className="insight-card-top">
-        <div className="insight-card-title">{title}</div>
-        <span className={`priority-badge ${priorityClass}`}>{priority}</span>
+    <div className={`insight-card priority-${priority}`}>
+      {/* header row */}
+      <div className="insight-card-header">
+        <span className="insight-title">{title}</span>
+        <div className="insight-meta">
+          <span className="priority-pill">{priority}</span>
+          <span className="insight-category">{categoryLabel}</span>
+        </div>
       </div>
 
-      <p className="insight-card-text">{insight_text}</p>
+      {/* insight text with bold support */}
+      <p className="insight-text">{parseBold(insight_text)}</p>
 
-      {category && (
-        <div className="insight-card-category">⌂ {category}</div>
+      {/* evidence fields */}
+      {evidence_fields.length > 0 && (
+        <div className="insight-evidence">
+          {evidence_fields.map((f) => (
+            <span key={f} className="evidence-tag">{f}</span>
+          ))}
+        </div>
       )}
+
+      {/* confidence bar */}
+      <div className="insight-confidence">
+        Confidence: {confPct}%
+        <span className="conf-bar">
+          <span
+            className="conf-fill"
+            style={{ width: `${confPct}%` }}
+          />
+        </span>
+      </div>
     </div>
   );
 }

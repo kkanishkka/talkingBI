@@ -1,216 +1,245 @@
 // src/components/DynamicChart.jsx
-// ─────────────────────────────────────────────────────────────────────
-// Renders ANY visualization object returned by /dashboard.
-// Zero hardcoded field names — everything is read from the viz config.
-// ─────────────────────────────────────────────────────────────────────
+// Renders ANY chart type based purely on the viz config object.
+// Reads x_field / y_field / label_field / value_field from the config —
+// never uses hardcoded column names like "dx", "age", "sex".
+//
+// Supported chart_types:
+//   bar | horizontal_bar | line | pie | donut | histogram | kpi_card
+
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
-  LineChart, Line, CartesianGrid,
-  PieChart, Pie, Legend,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  LineChart, Line,
+  PieChart, Pie, Cell, Legend,
 } from "recharts";
 
-// ── design tokens (mirrored from App.css CSS vars) ─────────────────
-const COLORS  = ["#5b8dee", "#f5a623", "#3ecf8e", "#f16b6b", "#a78bfa", "#38bdf8", "#fb923c", "#34d399"];
-const AMBER   = "#f5a623";
-const BLUE    = "#5b8dee";
-const GREEN   = "#3ecf8e";
+// ── colour palette (cycles for multi-series) ─────────────────────
+const PALETTE = [
+  "#4f8ef7", "#3dd68c", "#f5a623", "#9b7ff4",
+  "#f06060", "#38bdf8", "#fb923c", "#a3e635",
+];
 
-// ── shared tooltip ──────────────────────────────────────────────────
-function CustomTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={{
-      background: "var(--bg-3)",
-      border: "1px solid var(--border-hover)",
-      borderRadius: 6,
-      padding: "10px 14px",
-      fontFamily: "var(--font-mono)",
-      fontSize: 12,
-      color: "var(--text-primary)",
-      boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
-    }}>
-      <div style={{ color: "var(--text-secondary)", marginBottom: 4 }}>{label}</div>
-      <div style={{ color: "var(--accent)", fontWeight: 500 }}>
-        {typeof payload[0].value === "number"
-          ? payload[0].value.toLocaleString()
-          : payload[0].value}
-      </div>
-    </div>
-  );
+// ── tooltip style ─────────────────────────────────────────────────
+const TOOLTIP_STYLE = {
+  contentStyle: {
+    background: "#1a1e28",
+    border: "1px solid rgba(255,255,255,0.07)",
+    borderRadius: 6,
+    fontSize: 12,
+    color: "#e8ecf2",
+  },
+  itemStyle: { color: "#8b92a5" },
+  labelStyle: { color: "#e8ecf2", fontWeight: 600 },
+};
+
+// ── axis tick helper ──────────────────────────────────────────────
+function truncate(str, max = 12) {
+  if (typeof str !== "string") return str;
+  return str.length > max ? str.slice(0, max) + "…" : str;
 }
 
-// ── individual renderers ────────────────────────────────────────────
-
-function BarViz({ viz }) {
-  const { data, x_field, y_field, chart_type } = viz;
-  const layout = chart_type === "horizontal_bar" ? "vertical" : "horizontal";
-
+function CustomXTick({ x, y, payload }) {
   return (
-    <ResponsiveContainer width="100%" height={220}>
-      <BarChart
-        data={data}
-        layout={layout}
-        margin={{ top: 4, right: 8, left: layout === "vertical" ? 80 : -16, bottom: 0 }}
+    <g transform={`translate(${x},${y})`}>
+      <text
+        x={0} y={0} dy={12}
+        textAnchor="middle"
+        fill="#545c70"
+        fontSize={10}
       >
-        {layout === "horizontal" ? (
-          <>
-            <XAxis dataKey={x_field} tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} />
-          </>
-        ) : (
-          <>
-            <XAxis type="number" tick={{ fontSize: 10 }} />
-            <YAxis type="category" dataKey={x_field} tick={{ fontSize: 10 }} width={80} />
-          </>
-        )}
-        <Tooltip content={<CustomTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
-        <Bar dataKey={y_field} radius={[3, 3, 0, 0]}>
-          {data.map((_, i) => (
-            <Cell key={i} fill={COLORS[i % COLORS.length]} fillOpacity={0.85} />
-          ))}
-        </Bar>
-      </BarChart>
-    </ResponsiveContainer>
+        {truncate(String(payload.value ?? ""), 10)}
+      </text>
+    </g>
   );
 }
 
-function LineViz({ viz }) {
-  const { data, x_field, y_field } = viz;
+// ── custom label for pie ──────────────────────────────────────────
+function PieLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent }) {
+  if (percent < 0.05) return null;
+  const RADIAN = Math.PI / 180;
+  const radius = innerRadius + (outerRadius - innerRadius) * 0.55;
+  const x = cx + radius * Math.cos(-midAngle * RADIAN);
+  const y = cy + radius * Math.sin(-midAngle * RADIAN);
   return (
-    <ResponsiveContainer width="100%" height={220}>
-      <LineChart data={data} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-        <XAxis dataKey={x_field} tick={{ fontSize: 10 }} />
-        <YAxis tick={{ fontSize: 10 }} />
-        <Tooltip content={<CustomTooltip />} />
-        <Line
-          type="monotone"
-          dataKey={y_field}
-          stroke={BLUE}
-          strokeWidth={2}
-          dot={{ r: 3, fill: BLUE }}
-          activeDot={{ r: 5 }}
-        />
-      </LineChart>
-    </ResponsiveContainer>
+    <text x={x} y={y} fill="#fff" textAnchor="middle" dominantBaseline="central" fontSize={11}>
+      {`${(percent * 100).toFixed(0)}%`}
+    </text>
   );
 }
 
-function HistogramViz({ viz }) {
-  // histogram uses range/count but is fully driven by viz config
-  const { data, x_field, y_field } = viz;
-  return (
-    <ResponsiveContainer width="100%" height={220}>
-      <BarChart data={data} margin={{ top: 4, right: 8, left: -16, bottom: 0 }} barCategoryGap="4%">
-        <XAxis dataKey={x_field} tick={{ fontSize: 9 }} />
-        <YAxis tick={{ fontSize: 10 }} />
-        <Tooltip content={<CustomTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
-        <Bar dataKey={y_field} fill={GREEN} fillOpacity={0.8} radius={[3, 3, 0, 0]} />
-      </BarChart>
-    </ResponsiveContainer>
-  );
+// ── no data fallback ──────────────────────────────────────────────
+function NoData() {
+  return <div className="chart-no-data">No data available</div>;
 }
 
-function PieViz({ viz }) {
-  const { data, label_field, value_field } = viz;
-  return (
-    <ResponsiveContainer width="100%" height={220}>
-      <PieChart>
-        <Pie
-          data={data}
-          cx="50%"
-          cy="50%"
-          innerRadius={50}
-          outerRadius={78}
-          paddingAngle={3}
-          dataKey={value_field}
-          nameKey={label_field}
-        >
-          {data.map((_, i) => (
-            <Cell key={i} fill={COLORS[i % COLORS.length]} />
-          ))}
-        </Pie>
-        <Tooltip
-          formatter={(v, n) => [v.toLocaleString(), n]}
-          contentStyle={{
-            background: "var(--bg-3)",
-            border: "1px solid var(--border-hover)",
-            borderRadius: 6,
-            fontFamily: "var(--font-mono)",
-            fontSize: 12,
-            color: "var(--text-primary)",
-          }}
-        />
-        <Legend
-          iconType="circle"
-          iconSize={8}
-          formatter={(v) => (
-            <span style={{ color: "var(--text-secondary)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
-              {v}
-            </span>
-          )}
-        />
-      </PieChart>
-    </ResponsiveContainer>
-  );
-}
-
-function KpiCardViz({ viz }) {
-  const { data } = viz;
-  return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "repeat(2, 1fr)",
-      gap: 12,
-      padding: "8px 0",
-    }}>
-      {data.map(({ metric, value }) => (
-        <div key={metric} style={{
-          background: "var(--bg-3)",
-          border: "1px solid var(--border)",
-          borderRadius: 6,
-          padding: "12px 14px",
-        }}>
-          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 4 }}>
-            {metric}
-          </div>
-          <div style={{ fontFamily: "var(--font-display)", fontSize: 20, fontWeight: 700, color: "var(--accent)" }}>
-            {typeof value === "number" ? value.toLocaleString() : value}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ── main export ─────────────────────────────────────────────────────
-
-/**
- * Drop-in chart renderer.
- * Pass any visualization object from /dashboard and it picks the
- * correct chart type automatically — no switch statement needed in the parent.
- */
+// ═════════════════════════════════════════════════════════════════
+// Main component
+// ═════════════════════════════════════════════════════════════════
 export default function DynamicChart({ viz }) {
-  if (!viz?.data?.length) return (
-    <div style={{ padding: "20px 0", color: "var(--text-muted)", fontSize: 13, fontFamily: "var(--font-mono)" }}>
-      No data available for this chart.
-    </div>
-  );
+  if (!viz) return <NoData />;
 
-  switch (viz.chart_type) {
-    case "bar":
-    case "horizontal_bar":
-      return <BarViz viz={viz} />;
-    case "line":
-      return <LineViz viz={viz} />;
-    case "histogram":
-      return <HistogramViz viz={viz} />;
-    case "pie":
-    case "donut":
-      return <PieViz viz={viz} />;
-    case "kpi_card":
-      return <KpiCardViz viz={viz} />;
-    default:
-      return <BarViz viz={viz} />;  // safe fallback
+  const {
+    chart_type,
+    data = [],
+    x_field,
+    y_field,
+    label_field,
+    value_field,
+  } = viz;
+
+  if (!data.length) return <NoData />;
+
+  // ── BAR (vertical) ────────────────────────────────────────────
+  if (chart_type === "bar") {
+    if (!x_field || !y_field) return <NoData />;
+    return (
+      <ResponsiveContainer width="100%" height={240}>
+        <BarChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey={x_field} tick={<CustomXTick />} interval={0} />
+          <YAxis tick={{ fill: "#545c70", fontSize: 10 }} width={40} />
+          <Tooltip {...TOOLTIP_STYLE} />
+          <Bar dataKey={y_field} radius={[3, 3, 0, 0]}>
+            {data.map((_, i) => (
+              <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
   }
+
+  // ── HORIZONTAL BAR ────────────────────────────────────────────
+  if (chart_type === "horizontal_bar") {
+    if (!x_field || !y_field) return <NoData />;
+    // for horizontal bar, swap axes: x_field goes on Y axis, y_field on X
+    return (
+      <ResponsiveContainer width="100%" height={Math.max(200, data.length * 32)}>
+        <BarChart
+          layout="vertical"
+          data={data}
+          margin={{ top: 4, right: 8, left: 90, bottom: 4 }}
+        >
+          <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+          <XAxis
+            type="number"
+            tick={{ fill: "#545c70", fontSize: 10 }}
+          />
+          <YAxis
+            type="category"
+            dataKey={x_field}
+            tick={{ fill: "#8b92a5", fontSize: 11 }}
+            width={85}
+            tickFormatter={(v) => truncate(String(v ?? ""), 14)}
+          />
+          <Tooltip {...TOOLTIP_STYLE} />
+          <Bar dataKey={y_field} radius={[0, 3, 3, 0]}>
+            {data.map((_, i) => (
+              <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  // ── LINE ──────────────────────────────────────────────────────
+  if (chart_type === "line") {
+    if (!x_field || !y_field) return <NoData />;
+    return (
+      <ResponsiveContainer width="100%" height={240}>
+        <LineChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey={x_field} tick={<CustomXTick />} interval="preserveStartEnd" />
+          <YAxis tick={{ fill: "#545c70", fontSize: 10 }} width={40} />
+          <Tooltip {...TOOLTIP_STYLE} />
+          <Line
+            type="monotone"
+            dataKey={y_field}
+            stroke={PALETTE[0]}
+            strokeWidth={2}
+            dot={{ fill: PALETTE[0], r: 3 }}
+            activeDot={{ r: 5 }}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  // ── HISTOGRAM ─────────────────────────────────────────────────
+  if (chart_type === "histogram") {
+    // histogram uses "range" and "count" fields from backend
+    const xKey = x_field || "range";
+    const yKey = y_field || "count";
+    return (
+      <ResponsiveContainer width="100%" height={240}>
+        <BarChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 20 }}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey={xKey} tick={<CustomXTick />} interval={0} />
+          <YAxis tick={{ fill: "#545c70", fontSize: 10 }} width={40} />
+          <Tooltip {...TOOLTIP_STYLE} />
+          <Bar dataKey={yKey} fill={PALETTE[3]} radius={[2, 2, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  // ── PIE / DONUT ───────────────────────────────────────────────
+  if (chart_type === "pie" || chart_type === "donut") {
+    const lf = label_field || x_field;
+    const vf = value_field || y_field;
+    if (!lf || !vf) return <NoData />;
+
+    const innerRadius = chart_type === "donut" ? 55 : 0;
+
+    return (
+      <ResponsiveContainer width="100%" height={260}>
+        <PieChart>
+          <Pie
+            data={data}
+            dataKey={vf}
+            nameKey={lf}
+            cx="50%"
+            cy="50%"
+            outerRadius={95}
+            innerRadius={innerRadius}
+            labelLine={false}
+            label={<PieLabel />}
+          >
+            {data.map((_, i) => (
+              <Cell key={i} fill={PALETTE[i % PALETTE.length]} />
+            ))}
+          </Pie>
+          <Tooltip
+            {...TOOLTIP_STYLE}
+            formatter={(value, name) => [value.toLocaleString(), name]}
+          />
+          <Legend
+            iconSize={10}
+            wrapperStyle={{ fontSize: 11, color: "#8b92a5" }}
+            formatter={(value) => truncate(String(value ?? ""), 18)}
+          />
+        </PieChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  // ── KPI CARD ──────────────────────────────────────────────────
+  if (chart_type === "kpi_card") {
+    return (
+      <div className="kpi-card-grid">
+        {data.map((item, i) => (
+          <div key={i} className="kpi-item">
+            <span className="kpi-label">{item.metric ?? `Metric ${i + 1}`}</span>
+            <span className="kpi-value">
+              {typeof item.value === "number"
+                ? item.value.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                : item.value ?? "—"}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return <NoData />;
 }
