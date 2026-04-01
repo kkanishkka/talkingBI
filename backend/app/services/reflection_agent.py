@@ -1,236 +1,162 @@
 """
 app/services/reflection_agent.py
-════════════════════════════════════════════════════════════════════
-Agent 4: Reflector / Validator
+══════════════════════════════════════════════════════════════════════
+Agent 4: Reflection / Validator
 
-Responsibility:
-  After the Executor runs, validate that:
-    1. The result is non-empty and has reasonable row counts
-    2. The metric makes sense (rate values between 0-1, counts positive)
-    3. The intended metric matches what was computed
-    4. No obvious data quality issues (all-NaN, single-row results)
-    5. The chart will not be misleading (e.g. count shown when rate asked)
+Validates ExecutionResult against QueryIntent + AnalysisPlan.
+When a problem is found, produces a retry_suggestion so the
+PlanRefinement loop can attempt a fix before giving up.
 
-  Outputs a ValidationReport:
-  {
-    "valid": bool,
-    "issues": [str],          ← blocking problems
-    "warnings": [str],        ← non-blocking notices
-    "corrections": [str],     ← what was auto-fixed
-    "quality_score": 0.0-1.0
-  }
-
-  The dashboard only renders charts flagged as valid=True.
-  Issues are surfaced to the user if valid=False.
-
-Usage:
-  from app.services.reflection_agent import validate_result
-  report = validate_result(query_intent, plan, execution_result)
-════════════════════════════════════════════════════════════════════
+Checks:
+  1. Execution success + non-empty data
+  2. Rate values in [0,1]
+  3. Count values ≥ 0
+  4. Cardinality: warn if 1 row or >50 rows
+  5. All-same values (useless chart)
+  6. Metric mismatch between intent and plan ops
+  7. Aggressive filter: warn if rows dropped >90%
+══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+
+from app.core.models import (
+    AnalysisPlan, ExecutionResult, MetricType, QueryIntent,
+    ValidationReport,
+)
+
+import logging
+logger = logging.getLogger(__name__)
 
 
-# ── validators ────────────────────────────────────────────────────
+def _numeric_values(result: ExecutionResult) -> list[float]:
+    y = result.y_field
+    vals = []
+    for row in result.data:
+        v = row.get(y)
+        if v is not None:
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                pass
+    return vals
 
-def _check_empty(result: dict[str, Any]) -> list[str]:
-    issues = []
-    if not result.get("success"):
-        issues.append(f"Execution failed: {result.get('error', 'unknown error')}")
-    elif not result.get("data"):
-        issues.append("Execution returned no data rows.")
-    return issues
 
+def validate_result(
+    intent:   QueryIntent,
+    plan:     AnalysisPlan,
+    result:   ExecutionResult,
+) -> ValidationReport:
+    issues:      list[str] = []
+    warnings:    list[str] = []
+    corrections: list[str] = []
+    retry_suggestion: Optional[dict[str, Any]] = None
+    is_retryable = False
 
-def _check_metric_range(
-    intent: dict[str, Any],
-    result: dict[str, Any],
-) -> tuple[list[str], list[str]]:
-    """
-    For rate metrics: values should be in [0, 1].
-    For count: values should be non-negative integers.
-    """
-    issues:   list[str] = []
-    warnings: list[str] = []
+    # ── 1. Execution success ──────────────────────────────────────
+    if not result.success:
+        issues.append(f"Execution failed: {result.error or 'unknown error'}")
+        return ValidationReport(
+            valid=False, issues=issues, warnings=warnings,
+            corrections=corrections, quality_score=0.0,
+            is_retryable=False,
+        )
 
-    metric  = intent.get("metric", "count")
-    y_field = result.get("y_field", "value")
-    data    = result.get("data", [])
+    if not result.data:
+        issues.append("Execution returned no rows.")
+        is_retryable = True
+        retry_suggestion = {"change_metric": "count",
+                            "reason": "No data returned — trying count instead"}
+        return ValidationReport(
+            valid=False, issues=issues, warnings=warnings,
+            corrections=corrections, quality_score=0.0,
+            is_retryable=is_retryable, retry_suggestion=retry_suggestion,
+        )
 
-    if not data:
-        return issues, warnings
+    vals = _numeric_values(result)
 
-    values = [
-        float(row[y_field])
-        for row in data
-        if row.get(y_field) is not None
-    ]
-    if not values:
-        return issues, warnings
-
-    max_val = max(values)
-    min_val = min(values)
-
-    if metric == "rate":
+    # ── 2. Rate range check ───────────────────────────────────────
+    if intent.metric == MetricType.rate and vals:
+        max_val = max(vals)
         if max_val > 1.0:
             issues.append(
                 f"Rate values exceed 1.0 (max={max_val:.3f}). "
-                "This suggests count was computed instead of rate. "
-                "Check that agg_fn='rate' was used correctly."
+                "Count was likely computed instead of rate. "
+                "Verify rate_value matches the positive class in your data."
             )
-        if min_val < 0:
-            issues.append(f"Rate values are negative (min={min_val:.3f}). Data error.")
-        if max_val <= 0.001:
+            is_retryable = True
+            retry_suggestion = {
+                "change_metric": "count",
+                "reason": f"Rate > 1.0 (max={max_val:.3f}) — switching to count",
+            }
+        if vals and max(vals) < 0.001:
             warnings.append(
-                f"Rate values are extremely small (max={max_val:.5f}). "
-                "Verify the rate_value matches the positive class in your data."
+                f"Rate is extremely small (max={max(vals):.5f}). "
+                "Verify the positive class value is correct."
             )
 
-    elif metric == "count":
-        if max_val < 1:
-            warnings.append(
-                "Count values are less than 1 — results may be normalised proportions."
-            )
-        if min_val < 0:
-            issues.append("Count values are negative — unexpected data issue.")
+    # ── 3. Count/sum negativity ───────────────────────────────────
+    if intent.metric in (MetricType.count, MetricType.sum) and vals:
+        if min(vals) < 0:
+            issues.append(f"Negative {intent.metric} values detected — data issue.")
 
-    return issues, warnings
-
-
-def _check_cardinality(
-    intent: dict[str, Any],
-    result: dict[str, Any],
-) -> list[str]:
-    """Warn about extreme cardinality in results."""
-    warnings: list[str] = []
-    row_count = result.get("row_count", 0)
-
-    if row_count == 1:
+    # ── 4. Cardinality ────────────────────────────────────────────
+    if result.row_count == 1:
         warnings.append(
-            "Result has only 1 row — groupby may have matched only one category. "
-            "Verify the primary_dimension is correct."
+            "Result has only 1 row. Check that groupby column has multiple categories, "
+            "or that a filter didn't collapse the data."
         )
-    elif row_count > 50:
+    elif result.row_count > 50:
         warnings.append(
-            f"Result has {row_count} rows — consider adding top_n to limit to 10-20 "
-            "categories for a readable chart."
+            f"Result has {result.row_count} rows. "
+            "Consider adding top_n (e.g. 10–15) for a readable chart."
         )
-    return warnings
 
-
-def _check_single_value(result: dict[str, Any]) -> list[str]:
-    """Detect if all values are identical (useless chart)."""
-    warnings: list[str] = []
-    y_field = result.get("y_field", "value")
-    data    = result.get("data", [])
-
-    if not data or len(data) < 2:
-        return warnings
-
-    values = {
-        row[y_field]
-        for row in data
-        if row.get(y_field) is not None
-    }
-    if len(values) == 1:
+    # ── 5. All-same values ────────────────────────────────────────
+    if vals and len(set(round(v, 6) for v in vals)) == 1:
         warnings.append(
-            f"All result rows have identical value ({next(iter(values))}). "
-            "This chart will show no variation and may not be informative."
+            f"All result rows have the same value ({vals[0]}). "
+            "This chart will show no variation."
         )
-    return warnings
 
-
-def _check_metric_mismatch(
-    intent: dict[str, Any],
-    plan: dict[str, Any],
-) -> list[str]:
-    """Detect if the plan computes a different metric than the intent requested."""
-    warnings: list[str] = []
-
-    intent_metric = intent.get("metric")
-    plan_ops = plan.get("operations", [])
-
-    for op in plan_ops:
-        if op.get("op") == "groupby_agg":
-            plan_agg = op.get("args", {}).get("agg_fn")
-            if plan_agg and plan_agg != intent_metric:
+    # ── 6. Metric mismatch ────────────────────────────────────────
+    for op in plan.operations:
+        if op.op == "groupby_agg":
+            plan_agg = op.args.get("agg_fn")
+            if plan_agg and plan_agg != str(intent.metric):
                 warnings.append(
-                    f"Metric mismatch: intent requested '{intent_metric}' "
-                    f"but plan uses '{plan_agg}'. "
+                    f"Metric mismatch: intent='{intent.metric}' but plan uses '{plan_agg}'. "
                     "Verify the plan is correct."
                 )
-    return warnings
 
+    # ── 7. Aggressive filter check ────────────────────────────────
+    input_rows = result.intermediate_counts.get("input", 0)
+    if input_rows > 0:
+        final_rows_before_sort = max(
+            (v for k, v in result.intermediate_counts.items()
+             if "groupby" in k or "resample" in k or "value_counts" in k),
+            default=result.row_count,
+        )
+        if final_rows_before_sort < input_rows * 0.05:
+            warnings.append(
+                f"Filter reduced rows from {input_rows:,} to {final_rows_before_sort:,} "
+                f"({100*final_rows_before_sort/input_rows:.1f}% remaining). "
+                "Verify filter conditions are correct."
+            )
 
-def _compute_quality_score(
-    issues: list[str],
-    warnings: list[str],
-    row_count: int,
-) -> float:
-    """
-    Heuristic quality score 0-1.
-    Blocking issues heavily penalise. Warnings penalise lightly.
-    """
-    score = 1.0
-    score -= len(issues)   * 0.4
-    score -= len(warnings) * 0.1
-    if row_count < 3:
-        score -= 0.2
-    return round(max(0.0, min(1.0, score)), 2)
+    # ── quality score ─────────────────────────────────────────────
+    score = 1.0 - len(issues) * 0.4 - len(warnings) * 0.08
+    if result.row_count < 3:
+        score -= 0.15
+    score = round(max(0.0, min(1.0, score)), 2)
 
-
-# ── public API ────────────────────────────────────────────────────
-
-def validate_result(
-    query_intent:     dict[str, Any],
-    analysis_plan:    dict[str, Any],
-    execution_result: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Validate execution result against intent and plan.
-
-    Returns a ValidationReport:
-    {
-        "valid": bool,
-        "issues": list[str],
-        "warnings": list[str],
-        "corrections": list[str],
-        "quality_score": float
-    }
-    """
-    all_issues:   list[str] = []
-    all_warnings: list[str] = []
-    corrections:  list[str] = []
-
-    # check 1: did execution succeed?
-    empty_issues = _check_empty(execution_result)
-    all_issues.extend(empty_issues)
-
-    if not all_issues:  # only run further checks if data exists
-        # check 2: metric range validation
-        range_issues, range_warnings = _check_metric_range(query_intent, execution_result)
-        all_issues.extend(range_issues)
-        all_warnings.extend(range_warnings)
-
-        # check 3: cardinality
-        all_warnings.extend(_check_cardinality(query_intent, execution_result))
-
-        # check 4: all-same values
-        all_warnings.extend(_check_single_value(execution_result))
-
-        # check 5: metric mismatch
-        all_warnings.extend(_check_metric_mismatch(query_intent, analysis_plan))
-
-    row_count     = execution_result.get("row_count", 0)
-    quality_score = _compute_quality_score(all_issues, all_warnings, row_count)
-    is_valid      = len(all_issues) == 0 and row_count > 0
-
-    return {
-        "valid":         is_valid,
-        "issues":        all_issues,
-        "warnings":      all_warnings,
-        "corrections":   corrections,
-        "quality_score": quality_score,
-    }
+    return ValidationReport(
+        valid=          len(issues) == 0 and result.row_count > 0,
+        issues=         issues,
+        warnings=       warnings,
+        corrections=    corrections,
+        quality_score=  score,
+        is_retryable=   is_retryable,
+        retry_suggestion= retry_suggestion,
+    )

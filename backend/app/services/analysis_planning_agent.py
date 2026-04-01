@@ -1,347 +1,309 @@
 """
 app/services/analysis_planning_agent.py
-════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
 Agent 2: Analysis Planner
 
-Responsibility:
-  Given a QueryIntent, produce a concrete AnalysisPlan — a list of
-  ordered operations that the AnalysisExecutor can run deterministically
-  against the pandas DataFrame.
+Converts a QueryIntent → AnalysisPlan.
 
-  The planner knows HOW to compute each metric type:
-    - rate:   boolean proportion of target_variable == rate_value
-    - count:  value_counts or groupby size
-    - mean:   groupby mean
-    - sum:    groupby sum
-    - median: groupby median
-    - rank:   sort result by value
-
-  The executor NEVER interprets intent — it only executes the plan.
-  This separation is critical: it means the LLM can plan but cannot
-  hallucinate data (only the deterministic executor touches the df).
-
-Usage:
-  from app.services.analysis_planning_agent import build_analysis_plan
-  plan = build_analysis_plan(query_intent, schema_profile)
-════════════════════════════════════════════════════════════════════
+Key improvements:
+  - Multi-groupby support (secondary_dimension)
+  - formula_spec: human-readable formula string in response
+  - refinement_hint: accepts a correction signal from ReflectionAgent
+  - LLM path uses the shared llm_client (not a copy-pasted duplicate)
+  - Rule-based path covers all QuestionType variants
+══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
-import json
-import logging
-import os
-import re
-from typing import Any
+from typing import Any, Optional
 
+from app.core.llm_client import llm_client
+from app.core.models import (
+    AnalysisPlan, InferenceSource, MetricType, PlanOperation,
+    QueryIntent, QuestionType,
+)
+from app.services.semantic_classifier import find_best_metric
+
+import logging
 logger = logging.getLogger(__name__)
 
 
-# ── LLM helpers (re-used from query_understanding_agent pattern) ──
-
-def _llm_available() -> bool:
-    return bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))
-
-
-def _call_llm(system_prompt: str, user_message: str) -> str | None:
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            from openai import OpenAI
-            client = OpenAI()
-            resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message},
-                ],
-                temperature=0,
-                max_tokens=1000,
-                response_format={"type": "json_object"},
-            )
-            return resp.choices[0].message.content
-        except Exception as exc:
-            logger.warning("OpenAI call failed: %s", exc)
-            return None
-
-    if os.getenv("ANTHROPIC_API_KEY"):
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-            resp = client.messages.create(
-                model=os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307"),
-                max_tokens=1000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            return resp.content[0].text
-        except Exception as exc:
-            logger.warning("Anthropic call failed: %s", exc)
-            return None
-
-    return None
-
-
-# ── LLM prompt for planning ───────────────────────────────────────
+# ── LLM prompt ────────────────────────────────────────────────────
 
 _PLANNER_SYSTEM = """You are an analysis planning engine for a BI system.
 Given a QueryIntent and schema, produce a concrete AnalysisPlan as JSON.
 
-Output ONLY valid JSON with this schema:
+Output ONLY valid JSON:
 {
   "operations": [
-    {
-      "step": 1,
-      "op": "filter"|"groupby_agg"|"sort"|"top_n"|"value_counts"|"time_resample",
-      "args": { ... op-specific arguments ... }
-    }
+    {"step":1, "op":"filter|groupby_agg|value_counts|sort|top_n|time_resample", "args":{...}}
   ],
-  "result_columns": ["col1", "col2"],
+  "result_columns": ["col1","col2"],
   "x_field": "...",
   "y_field": "...",
   "metric_label": "...",
   "result_label": "...",
-  "confidence": 0.0 to 1.0,
+  "formula_spec": "human-readable formula",
+  "confidence": 0.0-1.0,
   "reasoning": "one sentence"
 }
 
-Operation arg schemas:
-  filter:         {"column":"...","operator":"=="|"!="|">"|"<"|">="|"<=","value":"..."}
-  groupby_agg:    {"group_by":["col"],"target":"col","agg_fn":"rate"|"count"|"mean"|"sum"|"median"|"max"|"min","rate_value":"yes"}
-  value_counts:   {"column":"col","normalize":true|false}
-  sort:           {"by":"col","ascending":false}
-  top_n:          {"n":10}
-  time_resample:  {"date_col":"col","freq":"M"|"Q"|"Y","target":"col","agg_fn":"count"|"sum"|"mean"}
+Operation args:
+  filter:        {"column":"...","operator":"==|!=|>|<|>=|<=","value":"..."}
+  groupby_agg:   {"group_by":["col1","col2"],"target":"col","agg_fn":"rate|count|mean|sum|median|max|min","rate_value":"yes"}
+  value_counts:  {"column":"col","normalize":false}
+  sort:          {"by":"value","ascending":false}
+  top_n:         {"n":10}
+  time_resample: {"date_col":"col","freq":"M|Q|Y|D|W","target":"col","agg_fn":"count|sum|mean"}
 
-Rules:
-- For "rate" metric: use groupby_agg with agg_fn="rate" and rate_value=the positive value
-- Always add a sort step for ranking questions
-- Always add top_n for top-N questions
-- result_columns must match what the executor will produce
+RULES:
+- rate = mean(target == rate_value) grouped by dimension
+- Always add sort step for ranking/comparison questions
+- top_n only if explicitly requested or > 15 result rows expected
+- formula_spec must be human-readable: e.g. "Subscription Rate (y='yes') by Job Category, sorted descending"
 - Output ONLY JSON. No markdown.
 """
 
 
-def _build_planner_message(
-    intent: dict[str, Any], schema_profile: dict[str, Any]
-) -> str:
+def _planner_user_message(intent: QueryIntent, schema_profile: dict[str, Any]) -> str:
+    import json as _json
+    intent_dict = intent.dict()
     cols = schema_profile.get("columns", [])
-    col_info = "\n".join(
-        f"  {c['name']} ({c['role']}, {c['dtype']}, "
+    col_summary = "\n".join(
+        f"  {c['name']} (role={c['role']}, hint={c.get('semantic_hint','none')}, "
         f"unique={c['unique_count']}"
-        + (f", top_values={[v['value'] for v in c.get('top_values', [])[:4]]}"
-           if c.get("top_values") else "")
+        + (f", top={[v['value'] for v in c.get('top_values',[])[:4]]}" if c.get('top_values') else "")
         + ")"
         for c in cols
     )
-    return (
-        f"QueryIntent:\n{json.dumps(intent, indent=2)}\n\n"
-        f"Schema columns:\n{col_info}"
-    )
-
-
-def _parse_llm_plan(raw: str) -> dict[str, Any] | None:
-    try:
-        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Failed to parse planner LLM response: %s", exc)
-        return None
+    return f"QueryIntent:\n{_json.dumps(intent_dict, indent=2)}\n\nSchema:\n{col_summary}"
 
 
 # ── rule-based planner ────────────────────────────────────────────
 
-def _find_rate_value(
-    target_col: str, schema_profile: dict[str, Any]
-) -> str:
-    """
-    Determine what value counts as 'positive' for a rate calculation.
-    Looks at top_values — picks 'yes', 'true', '1', or the less frequent value.
-    """
-    for col in schema_profile.get("columns", []):
-        if col["name"] != target_col:
-            continue
-        top = col.get("top_values", [])
-        if not top:
-            return "yes"
-        # common positive indicators
-        for positive in ("yes", "true", "1", "success", "subscribed", "converted"):
-            for tv in top:
-                if str(tv["value"]).lower() == positive:
-                    return tv["value"]
-        # fallback: less frequent value is usually the positive event
-        if len(top) >= 2:
-            return min(top, key=lambda x: x["count"])["value"]
-        return top[0]["value"]
-    return "yes"
+def _metric_label(metric: str, target: Optional[str]) -> str:
+    labels = {
+        "rate":   f"{target or 'Outcome'} Rate",
+        "count":  "Count",
+        "sum":    f"Total {target or 'Value'}",
+        "mean":   f"Average {target or 'Value'}",
+        "median": f"Median {target or 'Value'}",
+        "max":    f"Max {target or 'Value'}",
+        "min":    f"Min {target or 'Value'}",
+    }
+    return labels.get(metric, metric.title())
+
+
+def _formula_spec(intent: QueryIntent) -> str:
+    """Build a human-readable formula string."""
+    metric    = intent.metric
+    target    = intent.target_variable or "value"
+    dim       = intent.primary_dimension or "category"
+    second    = intent.secondary_dimension
+    rate_val  = intent.rate_value or "yes"
+    direction = "descending" if intent.sort_direction == "desc" else "ascending"
+
+    if metric == MetricType.rate:
+        base = f"Rate({target} = '{rate_val}')"
+    elif metric == MetricType.count:
+        base = f"Count of rows"
+    elif metric in (MetricType.mean, MetricType.median):
+        base = f"{metric.title()}({target})"
+    else:
+        base = f"{metric.title()}({target})"
+
+    grouping = f"grouped by {dim}"
+    if second:
+        grouping += f" and {second}"
+
+    if intent.question_type == QuestionType.trend:
+        return f"{base} over time ({intent.time_column})"
+
+    sort_str = ""
+    if intent.question_type in (QuestionType.ranking, QuestionType.comparison):
+        sort_str = f", sorted {direction}"
+    if intent.top_n:
+        sort_str += f", top {intent.top_n}"
+
+    return f"{base} {grouping}{sort_str}"
 
 
 def _rule_based_plan(
-    intent: dict[str, Any], schema_profile: dict[str, Any]
-) -> dict[str, Any]:
-    """Build an AnalysisPlan from QueryIntent using deterministic rules."""
+    intent:        QueryIntent,
+    schema_profile: dict[str, Any],
+    refinement_hint: Optional[dict[str, Any]] = None,
+) -> AnalysisPlan:
+    ops:   list[PlanOperation] = []
+    step   = 1
+    cols   = schema_profile.get("columns", [])
 
-    operations: list[dict[str, Any]] = []
-    step = 1
+    metric        = str(intent.metric)
+    primary_dim   = intent.primary_dimension
+    second_dim    = intent.secondary_dimension
+    target_var    = intent.target_variable
+    time_col      = intent.time_column
+    time_grain    = intent.time_grain or "M"
+    sort_dir      = intent.sort_direction == "asc"  # ascending=True means asc
+    top_n         = intent.top_n
 
-    question_type  = intent.get("question_type", "distribution")
-    metric         = intent.get("metric", "count")
-    primary_dim    = intent.get("primary_dimension")
-    target_var     = intent.get("target_variable")
-    time_col       = intent.get("time_column")
-    sort_direction = intent.get("sort_direction", "desc")
-    top_n          = intent.get("top_n")
-    filt           = intent.get("filter")
+    # apply refinement hint
+    if refinement_hint:
+        if "change_metric" in refinement_hint:
+            metric = refinement_hint["change_metric"]
+            logger.info("PlanBuilder: refinement applied — metric changed to %s", metric)
+        if "change_rate_value" in refinement_hint:
+            intent = intent.copy(update={"rate_value": refinement_hint["change_rate_value"]})
 
-    # step: filter (optional)
-    if filt:
-        operations.append({
-            "step": step,
-            "op": "filter",
-            "args": {
-                "column":   filt["column"],
-                "operator": filt.get("operator", "=="),
-                "value":    filt["value"],
-            },
-        })
+    # ── filter operations ─────────────────────────────────────────
+    for filt in intent.filters:
+        ops.append(PlanOperation(
+            step=step, op="filter",
+            args={"column": filt.column, "operator": filt.operator, "value": filt.value},
+        ))
         step += 1
 
-    # step: main aggregation
-    if question_type == "trend" and time_col:
-        freq = "M"
-        if "year" in intent.get("raw_prompt", "").lower():
-            freq = "Y"
-        elif "quarter" in intent.get("raw_prompt", "").lower():
-            freq = "Q"
+    # ── main aggregation ──────────────────────────────────────────
+    group_by = [g for g in [primary_dim, second_dim] if g]
 
-        operations.append({
-            "step": step,
-            "op": "time_resample",
-            "args": {
+    if intent.question_type == QuestionType.trend and time_col:
+        ops.append(PlanOperation(
+            step=step, op="time_resample",
+            args={
                 "date_col": time_col,
-                "freq":     freq,
+                "freq":     time_grain,
                 "target":   target_var or primary_dim,
                 "agg_fn":   metric if metric != "rate" else "count",
             },
-        })
+        ))
         step += 1
-        result_cols = [time_col, "value"]
-        x_field     = time_col
-        y_field     = "value"
+        x_field = time_col
+        y_field = "value"
 
-    elif primary_dim and (target_var or metric in ("count",)):
-        agg_fn = metric
-        rate_value = None
+    elif group_by:
+        agg_args: dict[str, Any] = {
+            "group_by": group_by,
+            "target":   target_var or (
+                find_best_metric(cols) if metric != "count" else group_by[0]
+            ),
+            "agg_fn":   metric,
+        }
+        if metric == "rate":
+            agg_args["rate_value"] = intent.rate_value or "yes"
 
-        if metric == "rate" and target_var:
-            rate_value = _find_rate_value(target_var, schema_profile)
-
-        operations.append({
-            "step": step,
-            "op": "groupby_agg",
-            "args": {
-                "group_by":   [primary_dim],
-                "target":     target_var or primary_dim,
-                "agg_fn":     agg_fn,
-                **({"rate_value": rate_value} if rate_value else {}),
-            },
-        })
+        ops.append(PlanOperation(step=step, op="groupby_agg", args=agg_args))
         step += 1
-        result_cols = [primary_dim, "value"]
-        x_field     = primary_dim
-        y_field     = "value"
+        x_field = primary_dim or group_by[0]
+        y_field = "value"
 
-    elif primary_dim:
-        operations.append({
-            "step": step,
-            "op": "value_counts",
-            "args": {"column": primary_dim, "normalize": False},
-        })
+    elif intent.question_type == QuestionType.distribution and primary_dim:
+        ops.append(PlanOperation(
+            step=step, op="value_counts",
+            args={"column": primary_dim, "normalize": False},
+        ))
         step += 1
-        result_cols = [primary_dim, "value"]
-        x_field     = primary_dim
-        y_field     = "value"
+        x_field = primary_dim
+        y_field = "value"
 
     else:
-        # last resort: profile the first dimension column
-        dims = [c for c in schema_profile.get("columns", []) if c["role"] == "dimension"]
-        col  = dims[0]["name"] if dims else "unknown"
-        operations.append({
-            "step": step,
-            "op":  "value_counts",
-            "args": {"column": col, "normalize": False},
-        })
+        # absolute fallback: value_counts on best dimension
+        from app.services.semantic_classifier import find_best_dimension
+        best = find_best_dimension(cols) or (cols[0]["name"] if cols else "unknown")
+        ops.append(PlanOperation(
+            step=step, op="value_counts",
+            args={"column": best, "normalize": False},
+        ))
         step += 1
-        result_cols = [col, "value"]
-        x_field     = col
-        y_field     = "value"
+        x_field = best
+        y_field = "value"
 
-    # step: sort
-    if question_type in ("ranking", "comparison", "aggregation"):
-        operations.append({
-            "step": step,
-            "op":   "sort",
-            "args": {"by": "value", "ascending": sort_direction == "asc"},
-        })
+    # ── sort ──────────────────────────────────────────────────────
+    if intent.question_type in (
+        QuestionType.ranking, QuestionType.comparison, QuestionType.aggregation
+    ):
+        ops.append(PlanOperation(
+            step=step, op="sort",
+            args={"by": "value", "ascending": sort_dir},
+        ))
         step += 1
 
-    # step: top-N
+    # ── top_n ─────────────────────────────────────────────────────
     if top_n:
-        operations.append({
-            "step": step,
-            "op":   "top_n",
-            "args": {"n": top_n},
-        })
+        ops.append(PlanOperation(step=step, op="top_n", args={"n": top_n}))
+        step += 1
+    elif intent.question_type == QuestionType.ranking:
+        # default top 15 for ranking
+        ops.append(PlanOperation(step=step, op="top_n", args={"n": 15}))
         step += 1
 
-    # metric label
-    metric_labels = {
-        "rate":   f"{target_var} Rate" if target_var else "Rate",
-        "count":  "Count",
-        "sum":    f"Total {target_var}" if target_var else "Total",
-        "mean":   f"Average {target_var}" if target_var else "Average",
-        "median": f"Median {target_var}" if target_var else "Median",
-        "max":    f"Max {target_var}" if target_var else "Max",
-        "min":    f"Min {target_var}" if target_var else "Min",
-    }
-    metric_label  = metric_labels.get(metric, metric.title())
-    result_label  = (
-        f"{metric_label} by {primary_dim.title()}"
-        if primary_dim else metric_label
+    ml = _metric_label(metric, target_var)
+    rl = f"{ml} by {primary_dim.title()}" if primary_dim else ml
+
+    return AnalysisPlan(
+        operations=     ops,
+        result_columns= [x_field, y_field],
+        x_field=        x_field,
+        y_field=        y_field,
+        metric_label=   ml,
+        result_label=   rl,
+        formula_spec=   _formula_spec(intent),
+        confidence=     0.82,
+        reasoning=      (
+            f"Rule-based plan: {intent.question_type}, metric={metric}, "
+            f"dim={primary_dim}, target={target_var}"
+        ),
     )
 
-    return {
-        "operations":    operations,
-        "result_columns": result_cols,
-        "x_field":       x_field,
-        "y_field":       y_field,
-        "metric_label":  metric_label,
-        "result_label":  result_label,
-        "confidence":    0.80,
-        "reasoning":     (
-            f"Rule-based plan: {question_type} with metric={metric}, "
-            f"dimension={primary_dim}, target={target_var}."
-        ),
-        "_source": "rule_based",
-    }
+
+# ── LLM path ─────────────────────────────────────────────────────
+
+def _llm_plan(
+    intent: QueryIntent, schema_profile: dict[str, Any]
+) -> Optional[AnalysisPlan]:
+    if not llm_client.available:
+        return None
+
+    msg  = _planner_user_message(intent, schema_profile)
+    data = llm_client.complete_json(_PLANNER_SYSTEM, msg, temperature=0.0)
+    if not data or not data.get("operations"):
+        return None
+
+    try:
+        ops = [
+            PlanOperation(step=o["step"], op=o["op"], args=o.get("args", {}))
+            for o in data["operations"]
+        ]
+        return AnalysisPlan(
+            operations=     ops,
+            result_columns= data.get("result_columns", []),
+            x_field=        data.get("x_field", ""),
+            y_field=        data.get("y_field", "value"),
+            metric_label=   data.get("metric_label", "Value"),
+            result_label=   data.get("result_label", "Analysis Result"),
+            formula_spec=   data.get("formula_spec", ""),
+            confidence=     float(data.get("confidence", 0.85)),
+            reasoning=      data.get("reasoning", ""),
+        )
+    except Exception as exc:
+        logger.warning("PlanBuilder: LLM response parse failed: %s", exc)
+        return None
 
 
 # ── public API ────────────────────────────────────────────────────
 
 def build_analysis_plan(
-    query_intent: dict[str, Any],
-    schema_profile: dict[str, Any],
-) -> dict[str, Any]:
+    intent:          QueryIntent,
+    schema_profile:  dict[str, Any],
+    refinement_hint: Optional[dict[str, Any]] = None,
+) -> AnalysisPlan:
     """
-    Main entry point.
-    Returns an AnalysisPlan dict. Always succeeds.
+    Convert QueryIntent → AnalysisPlan.
+    refinement_hint: optional correction from ReflectionAgent retry loop.
     """
-    if _llm_available():
-        msg = _build_planner_message(query_intent, schema_profile)
-        raw = _call_llm(_PLANNER_SYSTEM, msg)
-        if raw:
-            plan = _parse_llm_plan(raw)
-            if plan and plan.get("operations"):
-                plan["_source"] = "llm"
-                return plan
-        logger.info("LLM planner failed — falling back to rule-based plan.")
+    if refinement_hint is None and llm_client.available:
+        plan = _llm_plan(intent, schema_profile)
+        if plan:
+            logger.info("PlanBuilder: LLM path, %d operations", len(plan.operations))
+            return plan
+        logger.info("PlanBuilder: LLM failed, using rule-based plan")
 
-    return _rule_based_plan(query_intent, schema_profile)
+    return _rule_based_plan(intent, schema_profile, refinement_hint)

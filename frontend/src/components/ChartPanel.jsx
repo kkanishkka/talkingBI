@@ -1,35 +1,22 @@
 // src/components/ChartPanel.jsx
-// Wraps DynamicChart with a header (title + type badge) and a why-this-chart footnote.
-// All field resolution is delegated to DynamicChart — nothing is hardcoded here.
-
 import DynamicChart from "./DynamicChart";
 
 export default function ChartPanel({ viz }) {
   if (!viz) return null;
-
-  const {
-    title = "Chart",
-    chart_type = "bar",
-    why_this_chart = "",
-  } = viz;
+  const { title="Chart", chart_type="bar", why_this_chart="", is_primary=false, formula_spec="" } = viz;
 
   return (
-    <div className="chart-panel">
-      {/* header */}
+    <div className={`chart-panel${is_primary ? " primary-chart" : ""}`}>
       <div className="chart-panel-header">
         <span className="chart-title">{title}</span>
-        <span className="chart-type-badge">{chart_type}</span>
+        <div className="chart-badges">
+          {is_primary && <span className="primary-badge">Primary</span>}
+          <span className="chart-type-badge">{chart_type}</span>
+        </div>
       </div>
-
-      {/* chart body */}
-      <div className="chart-body">
-        <DynamicChart viz={viz} />
-      </div>
-
-      {/* rationale footnote */}
-      {why_this_chart && (
-        <p className="chart-why">{why_this_chart}</p>
-      )}
+      {formula_spec && <p className="chart-formula">{formula_spec}</p>}
+      <div className="chart-body"><DynamicChart viz={viz} /></div>
+      {why_this_chart && <p className="chart-why">{why_this_chart}</p>}
     </div>
   );
 }

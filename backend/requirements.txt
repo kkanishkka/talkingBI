@@ -1,5 +1,31 @@
-fastapi
-uvicorn
-pandas
-python-multipart
-openpyxl
+# TalkingBI backend dependencies
+# Install: pip install -r requirements.txt
+
+# ── Core framework ────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9      # required for FastAPI File/Form uploads
+
+# ── Data processing ───────────────────────────────────────────────
+pandas>=2.0.0                # format="mixed" datetime fix requires ≥2.0
+numpy>=1.26.0
+openpyxl>=3.1.0              # Excel xlsx support
+xlrd>=2.0.0                  # Excel xls support
+
+# ── Validation ────────────────────────────────────────────────────
+pydantic>=2.0.0
+
+# ── LLM clients (optional — system works without these) ──────────
+openai>=1.30.0               # OpenAI + compatible APIs (Azure, local)
+anthropic>=0.28.0            # Anthropic Claude
+
+# ── Database support (Sprint 3) ───────────────────────────────────
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0       # PostgreSQL
+pymysql>=1.1.0               # MySQL
+# sqlite3 is stdlib, no install needed
+
+# ── Testing ───────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0                # for FastAPI TestClient async support

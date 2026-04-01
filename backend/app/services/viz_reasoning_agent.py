@@ -1,257 +1,199 @@
 """
 app/services/viz_reasoning_agent.py
-════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
 Agent 5: Visualization Reasoner
 
-Replaces: chart_recommender.py
+Converts (QueryIntent + ExecutionResult) → VizSpec.
+Chart selection is intent-first, not column-type-first.
 
-Responsibility:
-  Choose the right chart type based on ANALYTICAL INTENT, not just
-  column types. This is the key difference from the old recommender.
-
-  Decision framework:
-  ┌─────────────────────────┬───────────────────────────────────┐
-  │ Intent                  │ Chart                             │
-  ├─────────────────────────┼───────────────────────────────────┤
-  │ ranking (many cats)     │ horizontal_bar (sorted desc)      │
-  │ ranking (few cats)      │ bar (sorted desc)                 │
-  │ comparison (2 groups)   │ bar side-by-side                  │
-  │ distribution (numeric)  │ histogram                         │
-  │ distribution (categoric)│ pie (≤5) or bar (>5)             │
-  │ trend over time         │ line                              │
-  │ correlation 2 metrics   │ scatter                           │
-  │ part-to-whole (≤6 cats) │ pie / donut                       │
-  │ KPI / single metric     │ kpi_card                          │
-  └─────────────────────────┴───────────────────────────────────┘
-
-Usage:
-  from app.services.viz_reasoning_agent import reason_visualization
-  viz_spec = reason_visualization(query_intent, execution_result, schema_profile)
-════════════════════════════════════════════════════════════════════
+Also: builds DashboardLayout options from a list of VizSpecs.
+══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
 from typing import Any
 
+from app.core.models import (
+    ChartType, DashboardLayout, ExecutionResult, LayoutCell,
+    MetricType, QueryIntent, QuestionType, VizSpec,
+)
 
-# ── chart selection logic ─────────────────────────────────────────
+import logging
+logger = logging.getLogger(__name__)
 
-def _select_chart_type(
+
+# ── chart selection ───────────────────────────────────────────────
+
+def _select_chart(
     question_type: str,
-    metric: str,
-    row_count: int,
-    x_field: str | None,
-    schema_profile: dict[str, Any],
-) -> str:
-    """
-    Core decision: pick chart type from analytical intent.
-    """
-    # trend → always line
-    if question_type == "trend":
-        return "line"
+    metric:        str,
+    row_count:     int,
+) -> ChartType:
+    if question_type == QuestionType.trend:
+        return ChartType.line
 
-    # correlation between two numeric fields → scatter
-    if question_type == "correlation":
-        return "scatter"
+    if question_type == QuestionType.correlation:
+        return ChartType.scatter
 
-    # ranking
-    if question_type == "ranking":
-        if row_count > 8:
-            return "horizontal_bar"
-        return "bar"
+    if question_type == QuestionType.ranking:
+        return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
 
-    # distribution of a numeric field → histogram
-    if question_type == "distribution" and metric in ("mean", "median", "sum"):
-        return "histogram"
+    if question_type == QuestionType.distribution:
+        if metric in (MetricType.mean, MetricType.median, MetricType.sum):
+            return ChartType.histogram
+        if row_count <= 5:
+            return ChartType.pie
+        return ChartType.bar
 
-    # distribution of a categorical with few values → pie
-    if question_type == "distribution" and row_count <= 5:
-        return "pie"
+    if question_type == QuestionType.comparison:
+        return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
 
-    # comparison or distribution with many categories → horizontal bar
-    if question_type in ("comparison", "distribution") and row_count > 8:
-        return "horizontal_bar"
+    if question_type == QuestionType.aggregation and row_count == 1:
+        return ChartType.kpi_card
 
-    # aggregation of a single metric → kpi card
-    if question_type == "aggregation" and row_count == 1:
-        return "kpi_card"
+    if metric == MetricType.rate:
+        return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
 
-    # rate metrics work best as bar charts (sorted)
-    if metric == "rate":
-        if row_count > 8:
-            return "horizontal_bar"
-        return "bar"
-
-    # part-to-whole with few categories
     if row_count <= 5:
-        return "pie"
+        return ChartType.pie
 
-    # default
-    return "bar"
+    return ChartType.bar
 
 
-def _build_annotations(
-    data: list[dict[str, Any]],
+_RATIONALE: dict[str, str] = {
+    ChartType.horizontal_bar: "Horizontal bar chart — optimal for ranked categorical comparison with readable labels.",
+    ChartType.bar:             "Bar chart — best for comparing a small number of discrete categories.",
+    ChartType.line:            "Line chart — shows temporal trends and value evolution over time.",
+    ChartType.pie:             "Pie chart — shows part-to-whole proportions for ≤5 categories.",
+    ChartType.histogram:       "Histogram — reveals distribution shape, skewness and clustering of numeric values.",
+    ChartType.kpi_card:        "KPI card — highlights a single summary statistic at a glance.",
+    ChartType.scatter:         "Scatter plot — visualises correlation between two numeric variables.",
+    ChartType.area:            "Area chart — emphasises cumulative volume over a continuous axis.",
+}
+
+
+def _format_annotations(
+    data:    list[dict[str, Any]],
     x_field: str,
     y_field: str,
-    metric: str,
-    top_n: int = 3,
+    metric:  str,
+    top_n:   int = 3,
 ) -> list[str]:
-    """
-    Generate callout annotations for the top-N rows.
-    For rate: format as percentage.
-    For count/sum: format with comma separator.
-    For mean: format to 2dp.
-    """
-    if not data or not x_field or not y_field:
-        return []
-
-    annotations = []
+    out = []
     for row in data[:top_n]:
-        x_val = row.get(x_field, "")
-        y_val = row.get(y_field)
-        if y_val is None:
+        x = row.get(x_field, "?")
+        y = row.get(y_field)
+        if y is None:
             continue
         try:
-            y_float = float(y_val)
-            if metric == "rate":
-                formatted = f"{y_float * 100:.1f}%"
-            elif metric in ("count", "sum"):
-                formatted = f"{int(y_float):,}"
+            f = float(y)
+            if metric == MetricType.rate:
+                fmt = f"{f * 100:.1f}%"
+            elif metric in (MetricType.count, MetricType.sum):
+                fmt = f"{int(f):,}"
             else:
-                formatted = f"{y_float:.2f}"
-            annotations.append(f"{x_val}: {formatted}")
-        except (ValueError, TypeError):
-            annotations.append(f"{x_val}: {y_val}")
+                fmt = f"{f:.2f}"
+            out.append(f"{x}: {fmt}")
+        except (TypeError, ValueError):
+            out.append(f"{x}: {y}")
+    return out
 
-    return annotations
 
-
-def _build_axis_labels(
-    metric: str,
-    metric_label: str,
-) -> dict[str, str]:
-    """Generate human-readable axis labels."""
-    if metric == "rate":
-        return {
-            "y_axis_label": f"{metric_label} (0–100%)",
-            "y_format":     "percent",
-        }
-    elif metric in ("count",):
-        return {
-            "y_axis_label": "Count",
-            "y_format":     "number",
-        }
-    else:
-        return {
-            "y_axis_label": metric_label,
-            "y_format":     "number",
-        }
+def _y_format(metric: str) -> str:
+    if metric == MetricType.rate:
+        return "percent"
+    return "number"
 
 
 # ── public API ────────────────────────────────────────────────────
 
 def reason_visualization(
-    query_intent:     dict[str, Any],
-    execution_result: dict[str, Any],
-    schema_profile:   dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Produce a VizSpec from the analytical intent and execution result.
+    intent: QueryIntent,
+    result: ExecutionResult,
+    schema_profile: dict[str, Any],
+    is_primary: bool = False,
+) -> VizSpec:
+    qt      = str(intent.question_type)
+    metric  = str(intent.metric)
+    x_field = result.x_field or ""
+    y_field = result.y_field or "value"
+    data    = result.data
 
-    Returns:
-    {
-        "chart_type": str,
-        "title": str,
-        "x_field": str,
-        "y_field": str,
-        "label_field": str | None,     ← for pie
-        "value_field": str | None,     ← for pie
-        "data": list[dict],
-        "annotations": list[str],
-        "y_format": "percent" | "number",
-        "y_axis_label": str,
-        "why_this_chart": str,
-        "confidence": float,
-    }
-    """
-    question_type = query_intent.get("question_type", "distribution")
-    metric        = query_intent.get("metric", "count")
-    top_n         = query_intent.get("top_n")
+    chart_type = _select_chart(qt, metric, result.row_count)
 
-    x_field      = execution_result.get("x_field", "")
-    y_field      = execution_result.get("y_field", "value")
-    data         = execution_result.get("data", [])
-    metric_label = execution_result.get("metric_label", "Value")
-    result_label = execution_result.get("result_label", "Analysis Result")
-    row_count    = execution_result.get("row_count", len(data))
+    label_field = x_field if chart_type in (ChartType.pie, ChartType.donut) else None
+    value_field = y_field if chart_type in (ChartType.pie, ChartType.donut) else None
 
-    # ── select chart type ──────────────────────────────────────
-    chart_type = _select_chart_type(
-        question_type=question_type,
-        metric=metric,
-        row_count=row_count,
-        x_field=x_field,
-        schema_profile=schema_profile,
+    annotations = _format_annotations(data, x_field, y_field, metric)
+    y_fmt       = _y_format(metric)
+    y_label     = result.metric_label
+
+    return VizSpec(
+        chart_type=     chart_type,
+        title=          result.result_label,
+        x_field=        x_field,
+        y_field=        y_field,
+        label_field=    label_field,
+        value_field=    value_field,
+        data=           data,
+        annotations=    annotations,
+        y_format=       y_fmt,
+        y_axis_label=   y_label,
+        why_this_chart= _RATIONALE.get(chart_type, ""),
+        confidence=     0.88,
+        is_primary=     is_primary,
+        formula_spec=   result.metric_label,
     )
 
-    # ── build annotations (top-3 callouts) ────────────────────
-    annotations = _build_annotations(data, x_field, y_field, metric)
 
-    # ── axis labels ────────────────────────────────────────────
-    axis_info = _build_axis_labels(metric, metric_label)
+# ── dashboard layout builder ──────────────────────────────────────
 
-    # ── pie/donut uses different field names ───────────────────
-    label_field = None
-    value_field = None
-    if chart_type in ("pie", "donut"):
-        label_field = x_field
-        value_field = y_field
+def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
+    """
+    Build 2 dashboard layout options from a list of VizSpecs.
 
-    # ── why-this-chart rationale ───────────────────────────────
-    rationale_map = {
-        "horizontal_bar": (
-            f"Horizontal bar chosen for {question_type} with {row_count} categories — "
-            "labels are readable and values are easy to compare."
-        ),
-        "bar": (
-            f"Bar chart chosen for {question_type} — "
-            f"ideal for comparing {row_count} discrete categories."
-        ),
-        "line": (
-            "Line chart chosen for trend analysis — "
-            "shows how values change over time continuously."
-        ),
-        "pie": (
-            f"Pie chart chosen for part-to-whole view — "
-            f"{row_count} categories fit cleanly in a pie."
-        ),
-        "histogram": (
-            "Histogram chosen for distribution analysis — "
-            "shows the spread and skewness of numeric values."
-        ),
-        "kpi_card": (
-            "KPI card chosen for single-metric summary — "
-            "surfaces the key number at a glance."
-        ),
-        "scatter": (
-            "Scatter plot chosen for correlation analysis — "
-            "shows the relationship between two numeric variables."
-        ),
-    }
-    why = rationale_map.get(chart_type, f"{chart_type} chosen for {question_type}.")
+    Layout 1 — "Focus": primary chart full-width, supporting charts below
+    Layout 2 — "Overview": 2×2 equal grid
 
-    return {
-        "chart_type":   chart_type,
-        "title":        result_label,
-        "x_field":      x_field,
-        "y_field":      y_field,
-        "label_field":  label_field,
-        "value_field":  value_field,
-        "data":         data,
-        "annotations":  annotations,
-        "y_format":     axis_info["y_format"],
-        "y_axis_label": axis_info["y_axis_label"],
-        "why_this_chart": why,
-        "confidence":   0.88,
-    }
+    Each LayoutCell references viz_specs by index.
+    """
+    n = len(viz_specs)
+    if n == 0:
+        return []
+
+    layouts: list[DashboardLayout] = []
+
+    # ── Layout 1: Focus ───────────────────────────────────────────
+    focus_cells: list[LayoutCell] = []
+    if n >= 1:
+        # primary chart full-width
+        focus_cells.append(LayoutCell(viz_index=0, col_start=1, col_span=12, row_span=2))
+    if n >= 2:
+        col_span = 6 if n >= 3 else 12
+        focus_cells.append(LayoutCell(viz_index=1, col_start=1, col_span=col_span, row_span=1))
+    if n >= 3:
+        focus_cells.append(LayoutCell(viz_index=2, col_start=7, col_span=6, row_span=1))
+    if n >= 4:
+        focus_cells.append(LayoutCell(viz_index=3, col_start=1, col_span=12, row_span=1))
+
+    layouts.append(DashboardLayout(
+        layout_id=   "focus",
+        layout_name= "Focus View",
+        description= "Primary analysis full-width, supporting context below.",
+        cells=       focus_cells,
+    ))
+
+    # ── Layout 2: Overview grid ───────────────────────────────────
+    overview_cells: list[LayoutCell] = []
+    positions = [(1, 6), (7, 6), (1, 6), (7, 6)]  # col_start, col_span
+    for i, (cs, cspan) in enumerate(positions[:n]):
+        overview_cells.append(LayoutCell(viz_index=i, col_start=cs, col_span=cspan, row_span=1))
+
+    layouts.append(DashboardLayout(
+        layout_id=   "overview",
+        layout_name= "Overview Grid",
+        description= "Equal-weight 2×2 grid for side-by-side comparison.",
+        cells=       overview_cells,
+    ))
+
+    return layouts

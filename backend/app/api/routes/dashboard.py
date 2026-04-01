@@ -1,227 +1,308 @@
 """
 app/api/routes/dashboard.py
-────────────────────────────────────────────────────────────────────
-Single combined endpoint that:
-  1. Receives an uploaded file + optional natural-language prompt
-  2. Profiles the schema  (schema_profiler)
-  3. Parses intent        (intent_parser)
-  4. Recommends charts    (chart_recommender)
-  5. Generates insights   (insight_engine)
-  6. Materialises chart-ready data from the actual DataFrame
-  7. Returns one clean JSON response the frontend can render generically
+══════════════════════════════════════════════════════════════════════
+Single entry point. Clean 6-agent pipeline. No dual paths.
 
-No existing service is rewritten — this router is the only new file.
-────────────────────────────────────────────────────────────────────
+Pipeline:
+  1  Load DataFrame
+  2  Profile schema + semantic enrichment   (schema_profiler)
+  3  Query Understanding                    (query_understanding_agent)
+  4  Analysis Planning                      (analysis_planning_agent)
+  5  Execution                              (analysis_executor)
+  6  Reflection + optional refinement       (reflection_agent + plan_refinement)
+  7  Viz Reasoning                          (viz_reasoning_agent)
+  8  Insight Narration                      (insight_narration_agent)
+  9  Assumption block                       (insight_narration_agent)
+  10 KPI Coverage                           (coverage_engine)
+  11 Dashboard Layouts                      (viz_reasoning_agent)
+  12 Dataset insights                       (insight_engine)
+  13 Assemble + return DashboardResponse
+
+Overview charts are generated using the same pipeline with
+synthetic intents — no separate code path.
+
+Response shape (see app/core/models.py DashboardResponse):
+  analysis_report, assumptions, kpi_coverage,
+  visualizations, layouts,
+  executive_summary, dataset_insights, dataset_profile,
+  session_id, warnings
+══════════════════════════════════════════════════════════════════════
 """
-
 from __future__ import annotations
 
-#from curses import raw
 import io
-from typing import Any
 import logging
+import time
+import uuid
+from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from app.services.schema_profiler import profile_dataframe
-#from app.services.intent_parser import parse_intent
-#from app.services.chart_recommender import recommend_charts
-from app.services.insight_engine import generate_insights
-
-
+from app.core.models import (
+    AnalysisPlan, AssumptionBlock, DashboardResponse, ExecutionResult,
+    KPICoverage, QueryIntent, QuestionType, VizSpec,
+)
+from app.core.session_store import session_store
+from app.services.schema_profiler import profile_dataframe, build_schema_context
 from app.services.query_understanding_agent import understand_query
 from app.services.analysis_planning_agent import build_analysis_plan
 from app.services.analysis_executor import execute_plan
 from app.services.reflection_agent import validate_result
-from app.services.viz_reasoning_agent import reason_visualization
-from app.services.insight_narration_agent import narrate_insights
+from app.services.plan_refinement import refine_and_execute
+from app.services.viz_reasoning_agent import reason_visualization, build_dashboard_layouts
+from app.services.insight_narration_agent import narrate_insights, build_assumption_block
+from app.services.insight_engine import generate_dataset_insights
+from app.services.coverage_engine import compute_kpi_coverage
 
-router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger(__name__)
+router = APIRouter(tags=["dashboard"])
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-
+# ── file loader ───────────────────────────────────────────────────
 
 def _load_dataframe(file: UploadFile) -> pd.DataFrame:
     filename = file.filename or ""
     ext      = filename.lower().rsplit(".", 1)[-1]
     raw      = file.file.read()
     if ext == "csv":
-        return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+        return pd.read_csv(io.BytesIO(raw))
     if ext in {"xlsx", "xls"}:
         return pd.read_excel(io.BytesIO(raw))
     raise HTTPException(
         status_code=400,
-        detail="Unsupported file type. Please upload a CSV or Excel file.",
+        detail=f"Unsupported file type '{ext}'. Please upload CSV or Excel.",
     )
- 
- 
-# ── legacy materialise (fallback overview charts) ─────────────────
- 
-def _materialise_overview_charts(
+
+
+# ── overview chart generator ──────────────────────────────────────
+
+def _build_overview_charts(
     schema_profile: dict[str, Any],
-    df: pd.DataFrame,
-    num_charts: int = 4,
+    df:             pd.DataFrame,
+    exclude_title:  str = "",
+    max_charts:     int = 3,
 ) -> list[dict[str, Any]]:
     """
-    Generate generic overview charts for the full dataset (no query).
-    This is the legacy path used when the query is empty / generic.
+    Build supporting overview charts using the same pipeline.
+    Uses synthetic intents per interesting column.
     """
-    from app.services.viz_reasoning_agent import reason_visualization
-    from app.services.query_understanding_agent import understand_query
-    from app.services.analysis_planning_agent import build_analysis_plan
-    from app.services.analysis_executor import execute_plan
- 
-    cols     = schema_profile.get("columns", [])
-    dims     = [c for c in cols if c["role"] == "dimension" and c["unique_count"] > 1]
-    metrics  = [c for c in cols if c["role"] == "metric"]
-    dates    = [c for c in cols if c["role"] == "date"]
- 
-    visualizations: list[dict[str, Any]] = []
- 
-    # chart candidates: date trends + dimensions + metrics
-    candidates = (
-        [(d, "trend",        "count") for d in dates[:1]]
-        + [(d, "ranking",    "count") for d in sorted(dims, key=lambda c: c["unique_count"])[:3]]
-        + [(m, "aggregation","mean")  for m in metrics[:2]]
-    )
- 
-    for col_profile, qtype, metric in candidates:
-        if len(visualizations) >= num_charts:
+    cols      = schema_profile.get("columns", [])
+    dims      = [c for c in cols
+                 if c["role"] == "dimension"
+                 and c.get("semantic_hint") not in ("likely_id", "high_cardinality")
+                 and c["unique_count"] > 1]
+    metrics   = [c for c in cols if c["role"] == "metric"]
+    dates     = [c for c in cols if c["role"] == "date"]
+
+    candidates: list[dict[str, Any]] = []
+
+    # date trends first
+    for d in dates[:1]:
+        candidates.append({
+            "question_type": QuestionType.trend,
+            "metric":        "count",
+            "primary_dimension": d["name"],
+            "time_column":   d["name"],
+            "sort_direction": "desc",
+        })
+
+    # low-cardinality dims
+    for dim in sorted(dims, key=lambda c: c["unique_count"])[:3]:
+        candidates.append({
+            "question_type": QuestionType.distribution,
+            "metric":        "count",
+            "primary_dimension": dim["name"],
+            "sort_direction": "desc",
+            "top_n":         10,
+        })
+
+    # metrics
+    for m in metrics[:2]:
+        candidates.append({
+            "question_type": QuestionType.distribution,
+            "metric":        "mean",
+            "target_variable": m["name"],
+            "primary_dimension": (dims[0]["name"] if dims else None),
+            "sort_direction": "desc",
+        })
+
+    charts: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if len(charts) >= max_charts:
             break
- 
-        col_name = col_profile["name"]
- 
-        # build a minimal synthetic intent for this column
-        synthetic_intent = {
-            "question_type":     qtype,
-            "primary_dimension": col_name if col_profile["role"] != "metric" else None,
-            "target_variable":   col_name if col_profile["role"] == "metric" else None,
-            "metric":            metric,
-            "filter":            None,
-            "time_column":       col_name if col_profile["role"] == "date" else None,
-            "sort_direction":    "desc",
-            "top_n":             10,
-            "raw_prompt":        f"Overview of {col_name}",
-            "num_visualizations": 1,
-        }
- 
-        plan   = build_analysis_plan(synthetic_intent, schema_profile)
+
+        synthetic = QueryIntent(
+            question_type=      candidate.get("question_type", QuestionType.distribution),
+            metric=             candidate.get("metric", "count"),
+            primary_dimension=  candidate.get("primary_dimension"),
+            target_variable=    candidate.get("target_variable"),
+            time_column=        candidate.get("time_column"),
+            sort_direction=     candidate.get("sort_direction", "desc"),
+            top_n=              candidate.get("top_n", 10),
+            raw_prompt=         f"Overview of {candidate.get('primary_dimension', 'dataset')}",
+        )
+
+        plan   = build_analysis_plan(synthetic, schema_profile)
         result = execute_plan(plan, df)
- 
-        if not result["success"] or not result["data"]:
+        report = validate_result(synthetic, plan, result)
+
+        if not report.valid or not result.data:
             continue
- 
-        viz = reason_visualization(synthetic_intent, result, schema_profile)
-        viz["why_this_chart"] = f"Overview: {col_profile.get('role', 'column')} analysis of {col_name}."
-        visualizations.append(viz)
- 
-    return visualizations
- 
- 
+
+        viz = reason_visualization(synthetic, result, schema_profile, is_primary=False)
+        if viz.title == exclude_title:
+            continue
+
+        charts.append(viz.dict())
+
+    return charts
+
+
 # ── main endpoint ─────────────────────────────────────────────────
- 
-@router.post("/dashboard")
+
+@router.post("/dashboard", response_model=None)
 async def generate_dashboard(
-    file:   UploadFile = File(...),
-    prompt: str        = Form(default="Give me a complete overview dashboard"),
+    file:       UploadFile = File(...),
+    prompt:     str        = Form(default="Give me a complete overview dashboard"),
+    session_id: str        = Form(default=""),
 ):
-    """
-    TalkingBI main endpoint.
-    Routes through the 6-agent pipeline for query-specific analysis,
-    with legacy overview charts as a complement/fallback.
-    """
-    # 1 — load data
+    t0 = time.time()
+    warnings_out: list[str] = []
+
+    # ── 1. Load data ──────────────────────────────────────────────
     try:
         df = _load_dataframe(file)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"File parsing failed: {exc}") from exc
- 
-    # 2 — profile schema
+
+    # ── 2. Profile ────────────────────────────────────────────────
     schema_profile = profile_dataframe(df)
- 
-    # ── AGENT PIPELINE ──────────────────────────────────────────
- 
-    # 3 — query understanding
-    query_intent = understand_query(prompt, schema_profile)
-    logger.info(
-        "Query understood: type=%s, metric=%s, dim=%s, target=%s, source=%s",
-        query_intent.get("question_type"),
-        query_intent.get("metric"),
-        query_intent.get("primary_dimension"),
-        query_intent.get("target_variable"),
-        query_intent.get("_source"),
+    schema_context = build_schema_context(schema_profile)
+
+    # ── 3. Session ────────────────────────────────────────────────
+    sid = session_id.strip() or str(uuid.uuid4())
+    session_store.update(
+        sid,
+        schema_context=schema_context,
+        last_accessed=time.time(),
     )
- 
-    # 4 — analysis planning
-    analysis_plan = build_analysis_plan(query_intent, schema_profile)
+
+    # ── 4. Query understanding ────────────────────────────────────
+    intent = understand_query(prompt, schema_profile)
     logger.info(
-        "Analysis planned: %d operations, source=%s",
-        len(analysis_plan.get("operations", [])),
-        analysis_plan.get("_source"),
+        "Dashboard [%s]: type=%s metric=%s dim=%s target=%s",
+        sid[:8], intent.question_type, intent.metric,
+        intent.primary_dimension, intent.target_variable,
     )
- 
-    # 5 — execution (deterministic pandas)
-    execution_result = execute_plan(analysis_plan, df)
-    logger.info(
-        "Execution: success=%s, rows=%d",
-        execution_result["success"],
-        execution_result["row_count"],
-    )
- 
-    # 6 — reflection / validation
-    validation = validate_result(query_intent, analysis_plan, execution_result)
-    logger.info(
-        "Validation: valid=%s, quality=%.2f, issues=%s",
-        validation["valid"],
-        validation["quality_score"],
-        validation["issues"],
-    )
- 
-    # 7 — visualization reasoning
+
+    # ── 5. Planning ───────────────────────────────────────────────
+    plan = build_analysis_plan(intent, schema_profile)
+
+    # ── 6. Execution + reflection + optional refinement ───────────
+    result   = execute_plan(plan, df)
+    report   = validate_result(intent, plan, result)
+    ref_log: list[str] = []
+
+    if not report.valid and report.is_retryable:
+        result, report, ref_log = refine_and_execute(
+            intent, plan, result, report, schema_profile, df
+        )
+        if ref_log:
+            warnings_out.extend(ref_log)
+
+    if result.sample_warning:
+        warnings_out.append(result.sample_warning)
+
+    # ── 7. Viz reasoning ──────────────────────────────────────────
     primary_viz: dict[str, Any] | None = None
-    if validation["valid"] and execution_result.get("data"):
-        primary_viz = reason_visualization(query_intent, execution_result, schema_profile)
- 
-    # 8 — insight narration
-    insight_report: dict[str, Any] = {}
-    if validation["valid"] and execution_result.get("data"):
-        insight_report = narrate_insights(query_intent, execution_result, primary_viz or {})
- 
-    # ── FALLBACK / OVERVIEW CHARTS ──────────────────────────────
-    # Always generate overview charts for dataset-level exploration.
-    # If primary_viz exists, prepend it (most relevant first).
-    overview_vizs = _materialise_overview_charts(schema_profile, df, num_charts=4)
- 
-    visualizations: list[dict[str, Any]] = []
-    if primary_viz:
-        primary_viz["is_primary"] = True
-        primary_viz["confidence"] = analysis_plan.get("confidence", 0.85)
-        visualizations.append(primary_viz)
-    visualizations.extend(overview_vizs)
- 
-    # ── OVERVIEW INSIGHTS (legacy, for the insights panel) ─────
-    # These cover dataset-level patterns (cross-column, quality, schema mix).
-    # The query-specific insight is in analysis_report.insight_report.
-    overview_insights_output = generate_insights(
-        intent={
-            "requested_fields": schema_profile["dataset_summary"]["column_names"],
-            "analysis_tasks":   [query_intent.get("question_type", "distribution")],
-            "business_goal":    query_intent.get("raw_prompt", ""),
-        },
-        charts=[],
-        schema_profile=schema_profile,
+    is_overview = (str(intent.question_type) == QuestionType.overview)
+
+    if report.valid and result.data and not is_overview:
+        viz = reason_visualization(intent, result, schema_profile, is_primary=True)
+        primary_viz = viz.dict()
+
+    # ── 8. Overview charts ────────────────────────────────────────
+    overview_charts = _build_overview_charts(
+        schema_profile,
+        df,
+        exclude_title=primary_viz["title"] if primary_viz else "",
+        max_charts=3 if not is_overview else 4,
     )
- 
-    # ── BUILD RESPONSE ──────────────────────────────────────────
+
+    all_vizs: list[dict[str, Any]] = []
+    if primary_viz:
+        all_vizs.append(primary_viz)
+    all_vizs.extend(overview_charts)
+
+    # ── 9. Insight narration ──────────────────────────────────────
+    insight_report = {}
+    if report.valid and result.data and not is_overview:
+        ir = narrate_insights(intent, result, primary_viz)
+        insight_report = ir.dict()
+
+    # ── 10. Assumption block ──────────────────────────────────────
+    assumption_block = build_assumption_block(
+        intent, plan.formula_spec
+    ).dict()
+
+    # ── 11. KPI coverage ──────────────────────────────────────────
+    kpi_coverage = compute_kpi_coverage(
+        intent_kpis= intent.requested_kpis,
+        viz_specs=   all_vizs,
+    ).dict()
+
+    # ── 12. Dashboard layouts ─────────────────────────────────────
+    viz_spec_objs = [VizSpec(**v) for v in all_vizs[:4]]
+    layouts = [l.dict() for l in build_dashboard_layouts(viz_spec_objs)]
+
+    # ── 13. Dataset insights ──────────────────────────────────────
+    dataset_output = generate_dataset_insights(
+        schema_profile,
+        {"raw_prompt": prompt, "business_goal": prompt},
+    )
+
+    # ── 14. Validation warnings ───────────────────────────────────
+    if not report.valid:
+        warnings_out.extend(report.issues)
+    warnings_out.extend(report.warnings)
+
+    elapsed = round(time.time() - t0, 2)
+    logger.info("Dashboard [%s]: generated in %.2fs, vizs=%d", sid[:8], elapsed, len(all_vizs))
+
+    # ── 15. Assemble response ─────────────────────────────────────
     return {
-        "message": "Dashboard generated successfully.",
- 
-        # dataset profile (unchanged shape for frontend)
+        "message": f"Dashboard generated in {elapsed}s.",
+        "session_id": sid,
+
+        # primary query output
+        "analysis_report": {
+            "query_intent":   intent.dict(),
+            "plan_summary":   {
+                "formula_spec":  plan.formula_spec,
+                "result_label":  plan.result_label,
+                "metric_label":  plan.metric_label,
+                "reasoning":     plan.reasoning,
+                "confidence":    plan.confidence,
+                "operations_count": len(plan.operations),
+            },
+            "validation":     report.dict(),
+            "insight_report": insight_report,
+        },
+
+        "assumptions":    assumption_block,
+        "kpi_coverage":   kpi_coverage,
+
+        # charts and layouts
+        "visualizations": all_vizs,
+        "layouts":        layouts,
+
+        # dataset-level context
+        "executive_summary": dataset_output["executive_summary"],
+        "dataset_insights":  dataset_output["insights"],
+
         "dataset_profile": {
             "rows":    schema_profile["dataset_summary"]["rows"],
             "columns": schema_profile["dataset_summary"]["columns"],
@@ -231,31 +312,13 @@ async def generate_dashboard(
                     "name":            c["name"],
                     "dtype":           c["dtype"],
                     "role":            c["role"],
+                    "semantic_hint":   c.get("semantic_hint", "none"),
                     "unique_count":    c["unique_count"],
                     "null_percentage": c["null_percentage"],
                 }
                 for c in schema_profile["columns"]
             ],
         },
- 
-        # overview: executive summary bullets + dataset insights
-        "executive_summary": overview_insights_output.get("executive_summary", []),
-        "insights":          overview_insights_output.get("insights", []),
- 
-        # charts (primary query chart first, then overview)
-        "visualizations": visualizations,
- 
-        # NEW: structured analysis output for query-specific display
-        "analysis_report": {
-            "query_intent":   query_intent,
-            "analysis_plan":  {
-                "operations":   analysis_plan.get("operations", []),
-                "result_label": analysis_plan.get("result_label", ""),
-                "metric_label": analysis_plan.get("metric_label", ""),
-                "reasoning":    analysis_plan.get("reasoning", ""),
-                "confidence":   analysis_plan.get("confidence", 0),
-            },
-            "validation":     validation,
-            "insight_report": insight_report,
-        },
+
+        "warnings": warnings_out,
     }

@@ -1,65 +1,79 @@
-// src/App.jsx — TalkingBI dynamic dashboard (improved)
-import { useState } from "react";
+// src/App.jsx
+import { useState, useCallback } from "react";
 import FileUpload        from "./components/FileUpload";
 import PromptBar         from "./components/PromptBar";
 import ExecutiveSummary  from "./components/ExecutiveSummary";
 import DatasetProfile    from "./components/DatasetProfile";
 import VisualizationGrid from "./components/VisualizationGrid";
 import InsightCard       from "./components/InsightCard";
+import AnalysisReport    from "./components/AnalysisReport";
+import AssumptionBlock   from "./components/AssumptionBlock";
+import KPICoverage       from "./components/KPICoverage";
+import LayoutSwitcher    from "./components/LayoutSwitcher";
+import FollowUpBar       from "./components/FollowUpBar";
 import LoadingSpinner    from "./components/LoadingSpinner";
 import { generateDashboard } from "./services/api";
-
+import "./App.css";
 
 export default function App() {
-  const [file,    setFile]    = useState(null);
-  const [prompt,  setPrompt]  = useState("");
-  const [data,    setData]    = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error,   setError]   = useState(null);
+  const [file,          setFile]          = useState(null);
+  const [prompt,        setPrompt]        = useState("");
+  const [data,          setData]          = useState(null);
+  const [sessionId,     setSessionId]     = useState("");
+  const [loading,       setLoading]       = useState(false);
+  const [error,         setError]         = useState(null);
+  const [activeLayout,  setActiveLayout]  = useState(0);
 
-  const handleGenerate = async () => {
-    if (!file) return;
+  const runQuery = useCallback(async (queryPrompt, queryFile, sid) => {
     setLoading(true);
     setError(null);
-    setData(null);
     try {
-      const result = await generateDashboard(file, prompt);
+      const result = await generateDashboard(queryFile, queryPrompt, sid);
       setData(result);
+      setSessionId(result.session_id || "");
+      setActiveLayout(0);
     } catch (err) {
       setError(err.message || "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  const handleGenerate  = ()  => file && runQuery(prompt, file, "");
+  const handleFollowUp  = (q) => file && q.trim() && runQuery(q, file, sessionId);
+  const handleReset     = ()  => {
+    setFile(null); setPrompt(""); setData(null);
+    setSessionId(""); setError(null); setActiveLayout(0);
   };
 
-  const handleReset = () => {
-    setFile(null);
-    setPrompt("");
-    setData(null);
-    setError(null);
-  };
+  const hasAnalysis = Boolean(data?.analysis_report?.insight_report?.headline);
+  const hasLayouts  = data?.layouts?.length > 0;
 
   return (
     <div className="app">
-      {/* ── Header ── */}
-      <header className="header">
+      <header className="app-header">
         <div className="header-inner">
-          <div className="logo">
+          <div className="header-brand">
             <span className="brand-icon">◈</span>
-            <span className="logo-text">TalkingBI</span>
+            <span className="brand-name">TalkingBI</span>
           </div>
-          <p className="header-tag">AI-powered Business Intelligence Dashboard</p>
+          <p className="header-tagline">AI-Powered Business Intelligence</p>
+          {sessionId && (
+            <span className="session-badge" title={`Session: ${sessionId}`}>
+              ● Session active
+            </span>
+          )}
         </div>
       </header>
 
-      {/* ── Upload + Prompt Panel ── */}
       <main className="app-main">
         {!data && !loading && (
           <section className="upload-section">
             <div className="upload-card">
-              <h2 className="upload-title">Upload your dataset</h2>
+              <h2 className="upload-title">Ask your data a question</h2>
               <p className="upload-subtitle">
-                CSV or Excel — any schema, any industry. TalkingBI adapts automatically.
+                Upload any CSV or Excel file. Type a business question.
+                TalkingBI plans the analysis, executes it, and explains what it found.
               </p>
               <FileUpload file={file} onFileChange={setFile} />
               <PromptBar
@@ -68,23 +82,16 @@ export default function App() {
                 onGenerate={handleGenerate}
                 disabled={!file || loading}
               />
-              {error && (
-                <div className="error-banner" role="alert">
-                  <span className="error-icon">⚠</span>
-                  <span>{error}</span>
-                </div>
-              )}
+              {error && <ErrorBanner message={error} />}
             </div>
           </section>
         )}
 
-        {/* ── Loading ── */}
         {loading && <LoadingSpinner />}
 
-        {/* ── Dashboard Output ── */}
         {data && !loading && (
           <div className="dashboard-output">
-            {/* top action bar */}
+            {/* ── Topbar ── */}
             <div className="dashboard-topbar">
               <div className="topbar-left">
                 <span className="dash-icon">◈</span>
@@ -96,54 +103,94 @@ export default function App() {
                   </span>
                 )}
               </div>
-              <button className="btn-reset" onClick={handleReset}>
-                ← New Dataset
-              </button>
+              <div className="topbar-right">
+                {hasLayouts && (
+                  <LayoutSwitcher
+                    layouts={data.layouts}
+                    active={activeLayout}
+                    onChange={setActiveLayout}
+                  />
+                )}
+                <button className="btn-reset" onClick={handleReset}>
+                  ← New Dataset
+                </button>
+              </div>
             </div>
 
-            {/* executive summary */}
+            {/* ── Warnings ── */}
+            {data.warnings?.length > 0 && (
+              <div className="warnings-strip">
+                {data.warnings.map((w, i) => (
+                  <div key={i} className="warning-item">⚠ {w}</div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Primary: query answer ── */}
+            {hasAnalysis && (
+              <AnalysisReport report={data.analysis_report} />
+            )}
+
+            {/* ── Assumptions + KPI Coverage ── */}
+            {(data.assumptions?.formula_spec || data.kpi_coverage) && (
+              <div className="meta-row">
+                {data.assumptions?.formula_spec && (
+                  <AssumptionBlock assumptions={data.assumptions} />
+                )}
+                {data.kpi_coverage && (
+                  <KPICoverage coverage={data.kpi_coverage} />
+                )}
+              </div>
+            )}
+
+            {/* ── Visualizations ── */}
+            {data.visualizations?.length > 0 && (
+              <VisualizationGrid
+                visualizations={data.visualizations}
+                layout={data.layouts?.[activeLayout] ?? null}
+              />
+            )}
+
+            {/* ── Follow-up query ── */}
+            {file && (
+              <FollowUpBar onSubmit={handleFollowUp} disabled={loading} />
+            )}
+
+            {/* ── Dataset context (below fold) ── */}
             {data.executive_summary?.length > 0 && (
               <ExecutiveSummary bullets={data.executive_summary} />
             )}
 
-            {/* dataset profile */}
-            {data.dataset_profile && (
-              <DatasetProfile profile={data.dataset_profile} />
-            )}
-
-            {/* visualizations */}
-            {data.visualizations?.length > 0 ? (
-              <VisualizationGrid visualizations={data.visualizations} />
-            ) : (
-              <div className="empty-state">
-                <span className="empty-icon">📊</span>
-                <p>No visualizations could be generated for this dataset.</p>
-              </div>
-            )}
-
-            {/* insights */}
-            {data.insights?.length > 0 && (
+            {data.dataset_insights?.length > 0 && (
               <section className="insights-section">
                 <h3 className="section-heading">
-                  <span className="section-icon">🔍</span> Data Insights
+                  <span className="section-icon">🔍</span> Dataset Insights
                 </h3>
                 <div className="insights-grid">
-                  {data.insights.map((insight, i) => (
-                    <InsightCard key={i} insight={insight} />
+                  {data.dataset_insights.map((ins, i) => (
+                    <InsightCard key={i} insight={ins} />
                   ))}
                 </div>
               </section>
             )}
 
-            {error && (
-              <div className="error-banner" role="alert">
-                <span className="error-icon">⚠</span>
-                <span>{error}</span>
-              </div>
+            {data.dataset_profile && (
+              <DatasetProfile profile={data.dataset_profile} />
             )}
+
+            {error && <ErrorBanner message={error} />}
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+function ErrorBanner({ message }) {
+  return (
+    <div className="error-banner" role="alert">
+      <span className="error-icon">⚠</span>
+      <span>{message}</span>
     </div>
   );
 }

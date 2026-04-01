@@ -1,22 +1,17 @@
 // src/components/PromptBar.jsx
-// Natural-language prompt input + generate button.
-
-const PLACEHOLDER_EXAMPLES = [
-  "Give me a complete overview dashboard",
-  "Show distribution and trends",
-  "Compare categories and highlight outliers",
-  "Summarize key metrics and segments",
+const EXAMPLES = [
+  "Which job category has the highest subscription rate?",
+  "Show revenue trend over time",
+  "Compare conversion rate by marital status",
+  "What is the average balance by job?",
 ];
 
 export default function PromptBar({ prompt, onPromptChange, onGenerate, disabled }) {
-  // pick a stable placeholder based on current second
-  const placeholder =
-    PLACEHOLDER_EXAMPLES[Math.floor(Date.now() / 10000) % PLACEHOLDER_EXAMPLES.length];
+  const placeholder = EXAMPLES[Math.floor(Date.now()/12000) % EXAMPLES.length];
 
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !disabled) {
-      e.preventDefault();
-      onGenerate();
+  const handleKey = (e) => {
+    if (e.key==="Enter" && !e.shiftKey && !disabled) {
+      e.preventDefault(); onGenerate();
     }
   };
 
@@ -26,15 +21,11 @@ export default function PromptBar({ prompt, onPromptChange, onGenerate, disabled
         className="prompt-input"
         rows={2}
         value={prompt}
-        onChange={(e) => onPromptChange(e.target.value)}
-        onKeyDown={handleKeyDown}
+        onChange={e=>onPromptChange(e.target.value)}
+        onKeyDown={handleKey}
         placeholder={`e.g. "${placeholder}"`}
       />
-      <button
-        className="btn-generate"
-        onClick={onGenerate}
-        disabled={disabled}
-      >
+      <button className="btn-generate" onClick={onGenerate} disabled={disabled}>
         Generate
       </button>
     </div>

@@ -1,187 +1,225 @@
 """
 app/services/schema_profiler.py
-────────────────────────────────────────────────────────────────────
-Profiles a DataFrame into a structured schema dict used downstream
-by chart_recommender, insight_engine, and the /dashboard endpoint.
+══════════════════════════════════════════════════════════════════════
+Profiles a DataFrame into a rich SchemaContext.
 
-Improvements:
-  - Stricter datetime detection
-  - Prevents plain 'day', 'month', 'year', 'pdays' style fields from
-    being wrongly classified as temporal
-  - Adds min/max/mean/median/std for metrics
-  - Adds top_values for dimensions
-  - Better BI role inference for IDs, booleans, low-cardinality numerics
-────────────────────────────────────────────────────────────────────
+Changes from original:
+  - Fixes pd.to_datetime warning: uses format="mixed" for pandas ≥2.0
+  - Avoids misclassifying day/month/year/pdays as date columns
+  - Adds skew to metric stats
+  - Enriches every column with semantic_hint via semantic_classifier
+  - Returns both a plain dict (backward-compat) AND a SchemaContext object
+══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
+import warnings
 from typing import Any
+
 import pandas as pd
+
+from app.core.models import ColumnProfile, ColumnRole, SchemaContext, SemanticHint
+from app.services.semantic_classifier import classify_all_columns
 
 
 # ── helpers ───────────────────────────────────────────────────────
 
-
 def _try_parse_datetime(series: pd.Series) -> bool:
     """
-    Return True if the series looks like a real datetime field.
-
-    Rules:
-    - Only object/string-like columns are eligible
-    - At least 80% of a sample must parse successfully
-    - Reject simple numeric-like values such as 1, 2, 3... that pandas may
-      incorrectly interpret as timestamps
+    Return True if the series is genuinely a datetime field.
+    Fixes: suppresses the pandas 'Could not infer format' FutureWarning
+    by using format='mixed' (pandas ≥2.0) or errors='coerce' + ratio check.
     """
     if series.empty:
         return False
-
-    # Only try parsing string/object columns
     if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
         return False
 
-    sample = series.dropna().astype(str).str.strip()
+    sample = series.dropna().astype(str).str.strip().head(100)
     if len(sample) == 0:
         return False
 
-    sample = sample.head(100)
-
-    # Reject purely numeric-looking values like "1", "12", "365"
-    # These are often codes / counts, not real dates
-    numeric_like_ratio = sample.str.fullmatch(r"-?\d+(\.\d+)?").mean()
-    if numeric_like_ratio > 0.8:
+    # Reject purely numeric-looking strings — these are counts, not dates
+    numeric_ratio = sample.str.fullmatch(r"-?\d+(\.\d+)?").mean()
+    if numeric_ratio > 0.8:
         return False
 
-    # Parse dates
     try:
-        parsed = pd.to_datetime(sample, errors="coerce")
-        success_ratio = parsed.notna().mean()
-        return success_ratio > 0.8
-    except Exception:
-        return False
+        # pandas ≥2.0: format="mixed" avoids the FutureWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+        return parsed.notna().mean() > 0.80
+    except TypeError:
+        # pandas <2.0 fallback
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True)
+            return parsed.notna().mean() > 0.80
+        except Exception:
+            return False
 
 
-def _safe_sample_values(series: pd.Series, limit: int = 5) -> list[Any]:
-    """Return up to `limit` non-null unique sample values."""
-    values = series.dropna().unique().tolist()
-    return [v for v in values[:limit]]
+_NON_DATE_TEMPORAL = frozenset({
+    "day", "month", "year", "weekday", "week", "quarter",
+    "pdays", "hour", "minute", "second",
+})
+
+_STRONG_DATE_KEYWORDS = (
+    "date", "timestamp", "datetime", "created_at", "updated_at",
+    "modified_at", "event_time", "order_date", "purchase_date",
+)
+
+_ID_SUFFIXES = ("_id", "_key", "_code")
 
 
-def _top_values(series: pd.Series, limit: int = 5) -> list[dict[str, Any]]:
-    """Return top-N values by frequency for a categorical series."""
+def _infer_role(series: pd.Series) -> ColumnRole:
+    col = series.name.lower().strip() if isinstance(series.name, str) else ""
+
+    # Explicit identifier
+    if col == "id" or any(col.endswith(s) for s in _ID_SUFFIXES) or col in ("rownum", "index"):
+        return ColumnRole.dimension  # keep as dim so it's not used as a metric
+
+    # Strong date name hints
+    if any(kw in col for kw in _STRONG_DATE_KEYWORDS):
+        return ColumnRole.date
+
+    # Avoid misclassifying plain numeric temporal-like columns
+    if col in _NON_DATE_TEMPORAL:
+        return ColumnRole.metric if pd.api.types.is_numeric_dtype(series) else ColumnRole.dimension
+
+    # Actual datetime dtype
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return ColumnRole.date
+
+    # Boolean → dimension
+    if pd.api.types.is_bool_dtype(series):
+        return ColumnRole.dimension
+
+    # Numeric
+    if pd.api.types.is_numeric_dtype(series):
+        unique_count  = series.nunique(dropna=True)
+        total_non_null = series.count()
+        if total_non_null > 0 and unique_count > 0:
+            if unique_count <= 10 and (unique_count / total_non_null) < 0.05:
+                return ColumnRole.dimension
+        return ColumnRole.metric
+
+    # Object/string → try datetime parse
+    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+        if _try_parse_datetime(series):
+            return ColumnRole.date
+        return ColumnRole.dimension
+
+    return ColumnRole.dimension
+
+
+def _safe_sample(series: pd.Series, limit: int = 5) -> list[Any]:
+    return series.dropna().unique().tolist()[:limit]
+
+
+def _top_values(series: pd.Series, limit: int = 8) -> list[dict[str, Any]]:
     vc = series.value_counts(dropna=True).head(limit)
     return [{"value": str(k), "count": int(v)} for k, v in vc.items()]
 
 
-def _infer_role(series: pd.Series) -> str:
-    """
-    Infer a BI role from the column name and dtype.
-    Returns: 'date' | 'metric' | 'dimension'
-    """
-    col = series.name.lower().strip() if isinstance(series.name, str) else ""
-
-    # Explicit identifier hints
-    id_keywords = ("_id", "_key", "rownum", "index")
-    if col == "id" or any(col.endswith(k) for k in id_keywords):
-        return "dimension"
-
-    # Strong date name hints only
-    # Avoid treating plain day/month/year columns as true dates
-    strong_date_keywords = (
-        "date",
-        "timestamp",
-        "datetime",
-        "created_at",
-        "updated_at",
-        "modified_at",
-        "event_time",
-        "order_date",
-    )
-    if any(kw in col for kw in strong_date_keywords):
-        return "date"
-
-    # Explicitly avoid misclassifying these as dates
-    non_date_temporal_like = {"day", "month", "year", "weekday", "week", "quarter", "pdays"}
-    if col in non_date_temporal_like:
-        if pd.api.types.is_numeric_dtype(series):
-            return "metric"
-        return "dimension"
-
-    # Dtype-based detection
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return "date"
-
-    if pd.api.types.is_bool_dtype(series):
-        return "dimension"
-
-    if pd.api.types.is_numeric_dtype(series):
-        unique_count = series.nunique(dropna=True)
-        total_non_null = series.count()
-
-        # low-cardinality numeric columns often behave like categories
-        if unique_count > 0 and unique_count <= 10 and total_non_null > 0:
-            unique_ratio = unique_count / total_non_null
-            if unique_ratio < 0.05:
-                return "dimension"
-
-        return "metric"
-
-    # object / string columns → cautious datetime parse
-    if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-        if _try_parse_datetime(series):
-            return "date"
-        return "dimension"
-
-    return "dimension"
-
-
 # ── public API ────────────────────────────────────────────────────
 
-
 def profile_dataframe(df: pd.DataFrame) -> dict[str, Any]:
-    """Generate a rich schema profile for a DataFrame."""
+    """
+    Profile a DataFrame and return a plain dict (backward-compatible).
+    Also enriches with semantic_hint via semantic_classifier.
+    """
     columns_profile: list[dict[str, Any]] = []
+    total_rows = len(df)
 
     for column in df.columns:
         series = df[column]
-        total_count = len(series)
-        null_count = int(series.isna().sum())
-        null_pct = round((null_count / total_count) * 100, 2) if total_count > 0 else 0.0
+        null_count  = int(series.isna().sum())
+        null_pct    = round((null_count / total_rows) * 100, 2) if total_rows > 0 else 0.0
         unique_count = int(series.nunique(dropna=True))
-        role = _infer_role(series)
-        dtype_str = str(series.dtype)
+        role        = _infer_role(series)
+        dtype_str   = str(series.dtype)
 
         col_profile: dict[str, Any] = {
-            "name": column,
-            "dtype": dtype_str,
-            "role": role,
-            "null_count": null_count,
+            "name":            column,
+            "dtype":           dtype_str,
+            "role":            role.value,
+            "null_count":      null_count,
             "null_percentage": null_pct,
-            "unique_count": unique_count,
-            "sample_values": _safe_sample_values(series),
+            "unique_count":    unique_count,
+            "sample_values":   _safe_sample(series),
+            "semantic_hint":   "none",  # will be overwritten below
         }
 
-        # extra stats per role
-        if role == "metric":
+        if role == ColumnRole.dimension:
+            col_profile["top_values"] = _top_values(series)
+
+        elif role == ColumnRole.metric:
             numeric = pd.to_numeric(series, errors="coerce").dropna()
             if len(numeric) > 0:
-                col_profile["min"] = round(float(numeric.min()), 4)
-                col_profile["max"] = round(float(numeric.max()), 4)
-                col_profile["mean"] = round(float(numeric.mean()), 4)
-                col_profile["median"] = round(float(numeric.median()), 4)
-                col_profile["std"] = round(float(numeric.std()), 4)
-
-        elif role == "dimension":
-            col_profile["top_values"] = _top_values(series)
+                col_profile.update({
+                    "min":    round(float(numeric.min()),    4),
+                    "max":    round(float(numeric.max()),    4),
+                    "mean":   round(float(numeric.mean()),   4),
+                    "median": round(float(numeric.median()), 4),
+                    "std":    round(float(numeric.std()),    4),
+                    "skew":   round(float(numeric.skew()),   4),
+                })
 
         columns_profile.append(col_profile)
 
+    # enrich with semantic hints
+    columns_profile = classify_all_columns(columns_profile, total_rows)
+
     dataset_summary = {
-        "rows": int(df.shape[0]),
-        "columns": int(df.shape[1]),
+        "rows":         int(df.shape[0]),
+        "columns":      int(df.shape[1]),
         "column_names": df.columns.tolist(),
     }
 
     return {
         "dataset_summary": dataset_summary,
-        "columns": columns_profile,
+        "columns":         columns_profile,
     }
+
+
+def build_schema_context(profile: dict[str, Any]) -> SchemaContext:
+    """Convert a plain profile dict into a typed SchemaContext object."""
+    summary  = profile["dataset_summary"]
+    col_list = []
+    for c in profile["columns"]:
+        try:
+            role = ColumnRole(c["role"])
+        except ValueError:
+            role = ColumnRole.dimension
+        try:
+            hint = SemanticHint(c.get("semantic_hint", "none"))
+        except ValueError:
+            hint = SemanticHint.none
+
+        col_list.append(ColumnProfile(
+            name=            c["name"],
+            dtype=           c.get("dtype", "object"),
+            role=            role,
+            semantic_hint=   hint,
+            null_count=      c.get("null_count", 0),
+            null_percentage= c.get("null_percentage", 0.0),
+            unique_count=    c.get("unique_count", 0),
+            sample_values=   c.get("sample_values", []),
+            top_values=      c.get("top_values", []),
+            min=             c.get("min"),
+            max=             c.get("max"),
+            mean=            c.get("mean"),
+            median=          c.get("median"),
+            std=             c.get("std"),
+            skew=            c.get("skew"),
+        ))
+
+    return SchemaContext(
+        rows=         summary["rows"],
+        columns=      summary["columns"],
+        column_names= summary["column_names"],
+        column_profiles= col_list,
+    )
