@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body
 
-from app.services.insight_engine import generate_insights
+from app.layers.presentation.insight_engine import generate_dataset_insights as generate_insights
 
 router = APIRouter(tags=["insights"])
 

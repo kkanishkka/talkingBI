@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body
 
 # intent_parser.py was deleted — replaced by query_understanding_agent
-from app.services.query_understanding_agent import understand_query
+from app.layers.reasoning.query_understanding import understand_query
 from app.services.schema_profiler import profile_dataframe
 
 router = APIRouter(tags=["analyze"])
