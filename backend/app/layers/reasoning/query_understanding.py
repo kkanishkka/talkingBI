@@ -237,12 +237,30 @@ def _match_columns(
     dates   = [c for c in columns if c["role"] == "date"]
     targets = [c for c in columns if c.get("semantic_hint") == SemanticHint.likely_target.value]
 
+    # Business term mapping
+    business_mapping = {
+        "category": ["category_name", "category", "cat_name", "product_category"],
+        "subcategory": ["subcategory_name", "sub_category", "subcat_name"],
+        "payment mode": ["payment_mode_name", "payment_mode", "payment_type"],
+        "payment": ["payment_mode_name", "payment_type", "payment_method"],
+        "profit": ["profit_amount", "profit", "net_profit", "margin"],
+        "amount": ["amount", "total_amount", "order_amount", "value"]
+    }
+    mentioned_business = {}
+    for term, candidates in business_mapping.items():
+        if term in low:
+            for cand in candidates:
+                matching = [c for c in dims + targets if cand == c["name"]]
+                if matching:
+                    mentioned_business[term] = matching[0]["name"]
+                    break
+
     primary_dim: Optional[str] = None
     second_dim:  Optional[str] = None
     target_var:  Optional[str] = None
     time_col:    Optional[str] = None
 
-    mentioned_dims = [c for c in dims if c["name"].lower() in low]
+    mentioned_dims = [c for c in dims if c["name"].lower() in low or c["name"] in mentioned_business.values()]
     if len(mentioned_dims) >= 2:
         primary_dim, second_dim = mentioned_dims[0]["name"], mentioned_dims[1]["name"]
     elif len(mentioned_dims) == 1:

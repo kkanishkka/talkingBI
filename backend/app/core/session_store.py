@@ -28,6 +28,7 @@ import time
 import uuid
 from typing import Any, Optional
 
+from flask import ctx
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
@@ -59,6 +60,12 @@ class SessionContext(BaseModel):
     # carry-forward from previous query
     previous_intent:  Optional[QueryIntent]     = None
     previous_result:  Optional[ExecutionResult] = None
+
+    datasource_type: Optional[str] = None
+    connection_string: Optional[str] = None
+    selected_table: Optional[str] = None
+    selected_table_schema: Optional[dict[str, Any]] = None
+    source_name: Optional[str] = None
 
     # conversation history
     conversation_turns: list[ConversationTurn] = Field(default_factory=list)
@@ -125,6 +132,51 @@ class SessionStore:
     - Eviction: lazy (on every get / new_session call)
     - Thread safety: GIL-protected for CPython (sufficient for single-process FastAPI)
     """
+    def set_datasource(
+        self,
+        session_id: str,
+        datasource_type: str,
+        connection_string: str,
+    ) -> None:
+        ctx = self._store.get(session_id)
+        if ctx is None:
+            return
+
+        ctx.datasource_type = datasource_type
+        ctx.connection_string = connection_string
+        ctx.last_accessed = time.time()
+
+
+    def set_selected_table(
+        self,
+        session_id: str,
+        table_name: str,
+        table_schema: dict[str, Any],
+    ) -> None:
+        ctx = self._store.get(session_id)
+        if ctx is None:
+            return
+
+        ctx.selected_table = table_name
+        ctx.selected_table_schema = table_schema
+        ctx.source_name = table_name
+        ctx.last_accessed = time.time()
+
+
+    def get_connection_string(self, session_id: str) -> Optional[str]:
+        ctx = self._store.get(session_id)
+        if ctx is None:
+            return None
+        ctx.last_accessed = time.time()
+        return ctx.connection_string
+
+
+    def get_selected_table(self, session_id: str) -> Optional[str]:
+        ctx = self._store.get(session_id)
+        if ctx is None:
+            return None
+        ctx.last_accessed = time.time()
+        return ctx.selected_table
 
     def __init__(self) -> None:
         self._store: dict[str, SessionContext] = {}

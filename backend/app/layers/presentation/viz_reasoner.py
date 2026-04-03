@@ -1,10 +1,16 @@
 """
 app/layers/presentation/viz_reasoner.py
 ══════════════════════════════════════════════════════════════════════
-Visualization Reasoner — moved from services/viz_reasoning_agent.py.
+Visualization Reasoner
 
-Logic is unchanged. Only the import path and module location differ.
-This keeps the deterministic chart-selection rules intact as required.
+Responsibilities:
+  1. Select the best primary chart for a query/result pair
+  2. Filter extra charts so dashboard stays query-aware
+  3. Build dashboard layouts from VizSpec objects
+
+Phase 1 additions:
+  - filter_vizs_by_intent()
+  - intent-aware allowed chart mapping
 ══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -29,37 +35,136 @@ def _select_chart(
 ) -> ChartType:
     if question_type == QuestionType.trend:
         return ChartType.line
+
     if question_type == QuestionType.correlation:
         return ChartType.scatter
+
     if question_type == QuestionType.ranking:
         return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
+
     if question_type == QuestionType.distribution:
         if metric in (MetricType.mean, MetricType.median, MetricType.sum):
             return ChartType.histogram
         if row_count <= 5:
             return ChartType.pie
         return ChartType.bar
+
     if question_type == QuestionType.comparison:
         return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
+
     if question_type == QuestionType.aggregation and row_count == 1:
         return ChartType.kpi_card
+
     if metric == MetricType.rate:
         return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
+
     if row_count <= 5:
         return ChartType.pie
+
     return ChartType.bar
 
 
 _RATIONALE: dict[str, str] = {
     ChartType.horizontal_bar: "Horizontal bar chart — optimal for ranked categorical comparison with readable labels.",
-    ChartType.bar:             "Bar chart — best for comparing a small number of discrete categories.",
-    ChartType.line:            "Line chart — shows temporal trends and value evolution over time.",
-    ChartType.pie:             "Pie chart — shows part-to-whole proportions for ≤5 categories.",
-    ChartType.histogram:       "Histogram — reveals distribution shape, skewness and clustering of numeric values.",
-    ChartType.kpi_card:        "KPI card — highlights a single summary statistic at a glance.",
-    ChartType.scatter:         "Scatter plot — visualises correlation between two numeric variables.",
-    ChartType.area:            "Area chart — emphasises cumulative volume over a continuous axis.",
+    ChartType.bar:            "Bar chart — best for comparing a small number of discrete categories.",
+    ChartType.line:           "Line chart — shows temporal trends and value evolution over time.",
+    ChartType.pie:            "Pie chart — shows part-to-whole proportions for ≤5 categories.",
+    ChartType.histogram:      "Histogram — reveals distribution shape, skewness and clustering of numeric values.",
+    ChartType.kpi_card:       "KPI card — highlights a single summary statistic at a glance.",
+    ChartType.scatter:        "Scatter plot — visualises correlation between two numeric variables.",
+    ChartType.area:           "Area chart — emphasises cumulative volume over a continuous axis.",
 }
+
+
+# ── Query-aware filtering ─────────────────────────────────────────
+
+_INTENT_ALLOWED_CHARTS: dict[str, set[str]] = {
+    str(QuestionType.trend): {
+        str(ChartType.line),
+        str(ChartType.area),
+    },
+    str(QuestionType.ranking): {
+        str(ChartType.bar),
+        str(ChartType.horizontal_bar),
+    },
+    str(QuestionType.comparison): {
+        str(ChartType.bar),
+        str(ChartType.horizontal_bar),
+    },
+    str(QuestionType.distribution): {
+        str(ChartType.histogram),
+        str(ChartType.bar),
+        str(ChartType.pie),
+        str(ChartType.donut),
+    },
+    str(QuestionType.aggregation): {
+        str(ChartType.kpi_card),
+        str(ChartType.bar),
+        str(ChartType.horizontal_bar),
+    },
+    str(QuestionType.correlation): {
+        str(ChartType.scatter),
+    },
+    str(QuestionType.filtered_lookup): {
+        str(ChartType.bar),
+        str(ChartType.horizontal_bar),
+        str(ChartType.kpi_card),
+        str(ChartType.pie),
+    },
+    str(QuestionType.overview): {
+        str(ChartType.line),
+        str(ChartType.area),
+        str(ChartType.bar),
+        str(ChartType.horizontal_bar),
+        str(ChartType.pie),
+        str(ChartType.donut),
+        str(ChartType.histogram),
+        str(ChartType.kpi_card),
+        str(ChartType.scatter),
+    },
+}
+
+
+def filter_vizs_by_intent(
+    visualizations: list[dict[str, Any]],
+    intent: QueryIntent,
+) -> list[dict[str, Any]]:
+    """
+    Keep only charts relevant to the current query intent.
+
+    Rules:
+    - Always preserve the primary chart
+    - For non-overview intents, remove overview charts whose chart_type
+      is not allowed for the detected question_type
+    - If filtering removes everything except the primary chart, that's okay
+    """
+    if not visualizations:
+        return []
+
+    qtype = str(intent.question_type)
+    allowed = _INTENT_ALLOWED_CHARTS.get(qtype)
+
+    if not allowed:
+        return visualizations
+
+    filtered: list[dict[str, Any]] = []
+
+    for idx, viz in enumerate(visualizations):
+        chart_type = str(viz.get("chart_type", ""))
+
+        # Always keep first chart if it is the primary analysis result
+        if idx == 0 and viz.get("is_primary"):
+            filtered.append(viz)
+            continue
+
+        if chart_type in allowed:
+            filtered.append(viz)
+
+    # Safety fallback: if everything got filtered out, keep original first chart
+    if not filtered and visualizations:
+        filtered.append(visualizations[0])
+
+    return filtered
 
 
 def _format_annotations(
@@ -155,7 +260,8 @@ def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
         focus_cells.append(LayoutCell(viz_index=3, col_start=1, col_span=12, row_span=1))
 
     layouts.append(DashboardLayout(
-        layout_id="focus", layout_name="Focus View",
+        layout_id="focus",
+        layout_name="Focus View",
         description="Primary analysis full-width, supporting context below.",
         cells=focus_cells,
     ))
@@ -167,7 +273,8 @@ def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
         overview_cells.append(LayoutCell(viz_index=i, col_start=cs, col_span=cspan, row_span=1))
 
     layouts.append(DashboardLayout(
-        layout_id="overview", layout_name="Overview Grid",
+        layout_id="overview",
+        layout_name="Overview Grid",
         description="Equal-weight 2×2 grid for side-by-side comparison.",
         cells=overview_cells,
     ))
