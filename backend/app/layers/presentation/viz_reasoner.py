@@ -1,20 +1,31 @@
 """
 app/layers/presentation/viz_reasoner.py
 ══════════════════════════════════════════════════════════════════════
-Visualization Reasoner
+Visualization Reasoner — v3
 
-Responsibilities:
-  1. Select the best primary chart for a query/result pair
-  2. Filter extra charts so dashboard stays query-aware
-  3. Build dashboard layouts from VizSpec objects
+Changes from v2:
+  ① is_kpi_only() helper: detects when result is a scalar (1 row,
+    x_field="metric") and returns kpi_card — never a bar/line chart.
 
-Phase 1 additions:
-  - filter_vizs_by_intent()
-  - intent-aware allowed chart mapping
+  ② _select_chart() updated:
+    - aggregation + 1 row → kpi_card (was already there but plan never
+      produced 1-row results — now it does via scalar_agg)
+    - distribution → pie ONLY if ≤6 categories, otherwise bar
+    - ranking → horizontal_bar if >5 rows, bar if ≤5
+    - correlation → scatter
+    - default → bar (not histogram)
+
+  ③ filter_vizs_by_intent() preserved — unchanged.
+
+  ④ reason_visualization() now detects KPI result and returns
+    kpi_card spec with properly formatted kpi_value and kpi_label.
+
+  ⑤ build_dashboard_layouts() unchanged.
 ══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.core.models import (
@@ -22,105 +33,122 @@ from app.core.models import (
     MetricType, QueryIntent, QuestionType, VizSpec,
 )
 
-import logging
 logger = logging.getLogger(__name__)
 
 
-# ── Chart selection ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 1 — KPI detection
+# ═══════════════════════════════════════════════════════════════════
+
+def is_kpi_result(result: ExecutionResult) -> bool:
+    """
+    Returns True if the result is a scalar KPI (1 row, x_field="metric").
+    These should be rendered as KPI cards, never as charts.
+    """
+    return (
+        result.row_count == 1
+        and result.x_field == "metric"
+        and result.y_field == "value"
+    )
+
+
+def _format_kpi_value(value: Any, metric: str) -> str:
+    """Format a scalar KPI value for display."""
+    try:
+        f = float(value)
+        if metric == MetricType.rate:
+            return f"{f * 100:.1f}%"
+        if metric in (MetricType.count,):
+            return f"{int(f):,}"
+        if metric == MetricType.sum:
+            if abs(f) >= 1_000_000:
+                return f"{f/1_000_000:.2f}M"
+            if abs(f) >= 1_000:
+                return f"{f/1_000:.1f}K"
+            return f"{f:,.2f}"
+        return f"{f:,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 2 — chart type selection
+# ═══════════════════════════════════════════════════════════════════
 
 def _select_chart(
     question_type: str,
     metric:        str,
     row_count:     int,
+    is_kpi:        bool = False,
 ) -> ChartType:
-    if question_type == QuestionType.trend:
+    """
+    Strict rule-based chart selection.
+    Every mapping is query-intent driven — no schema guessing.
+    """
+    # KPI takes absolute priority
+    if is_kpi or (question_type == str(QuestionType.aggregation) and row_count <= 1):
+        return ChartType.kpi_card
+
+    if question_type == str(QuestionType.trend):
         return ChartType.line
 
-    if question_type == QuestionType.correlation:
+    if question_type == str(QuestionType.correlation):
         return ChartType.scatter
 
-    if question_type == QuestionType.ranking:
-        return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
+    if question_type == str(QuestionType.ranking):
+        return ChartType.horizontal_bar if row_count > 5 else ChartType.bar
 
-    if question_type == QuestionType.distribution:
-        if metric in (MetricType.mean, MetricType.median, MetricType.sum):
-            return ChartType.histogram
-        if row_count <= 5:
+    if question_type == str(QuestionType.distribution):
+        # Pie only for very few categories, never for large sets
+        if row_count <= 6:
             return ChartType.pie
         return ChartType.bar
 
-    if question_type == QuestionType.comparison:
+    if question_type == str(QuestionType.comparison):
         return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
 
-    if question_type == QuestionType.aggregation and row_count == 1:
-        return ChartType.kpi_card
+    if question_type == str(QuestionType.aggregation):
+        # Multiple-row aggregation (grouped) → bar
+        return ChartType.bar
 
-    if metric == MetricType.rate:
+    if metric == str(MetricType.rate):
         return ChartType.horizontal_bar if row_count > 7 else ChartType.bar
 
-    if row_count <= 5:
-        return ChartType.pie
-
+    # Safe default — always bar for grouped data
     return ChartType.bar
 
 
-_RATIONALE: dict[str, str] = {
-    ChartType.horizontal_bar: "Horizontal bar chart — optimal for ranked categorical comparison with readable labels.",
-    ChartType.bar:            "Bar chart — best for comparing a small number of discrete categories.",
-    ChartType.line:           "Line chart — shows temporal trends and value evolution over time.",
-    ChartType.pie:            "Pie chart — shows part-to-whole proportions for ≤5 categories.",
-    ChartType.histogram:      "Histogram — reveals distribution shape, skewness and clustering of numeric values.",
-    ChartType.kpi_card:       "KPI card — highlights a single summary statistic at a glance.",
-    ChartType.scatter:        "Scatter plot — visualises correlation between two numeric variables.",
-    ChartType.area:           "Area chart — emphasises cumulative volume over a continuous axis.",
+_CHART_RATIONALE: dict[str, str] = {
+    str(ChartType.horizontal_bar): "Horizontal bar — optimal for ranked categorical comparison.",
+    str(ChartType.bar):            "Bar chart — best for comparing discrete categories.",
+    str(ChartType.line):           "Line chart — shows temporal trend and value evolution.",
+    str(ChartType.pie):            "Pie chart — part-to-whole for ≤6 categories.",
+    str(ChartType.histogram):      "Histogram — distribution shape of a numeric column.",
+    str(ChartType.kpi_card):       "KPI card — single scalar metric, no chart needed.",
+    str(ChartType.scatter):        "Scatter plot — correlation between two numeric variables.",
+    str(ChartType.area):           "Area chart — cumulative volume over time.",
 }
 
 
-# ── Query-aware filtering ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 3 — intent-allowed chart filter
+# ═══════════════════════════════════════════════════════════════════
 
 _INTENT_ALLOWED_CHARTS: dict[str, set[str]] = {
-    str(QuestionType.trend): {
-        str(ChartType.line),
-        str(ChartType.area),
-    },
-    str(QuestionType.ranking): {
-        str(ChartType.bar),
-        str(ChartType.horizontal_bar),
-    },
-    str(QuestionType.comparison): {
-        str(ChartType.bar),
-        str(ChartType.horizontal_bar),
-    },
-    str(QuestionType.distribution): {
-        str(ChartType.histogram),
-        str(ChartType.bar),
-        str(ChartType.pie),
-        str(ChartType.donut),
-    },
-    str(QuestionType.aggregation): {
-        str(ChartType.kpi_card),
-        str(ChartType.bar),
-        str(ChartType.horizontal_bar),
-    },
-    str(QuestionType.correlation): {
-        str(ChartType.scatter),
-    },
-    str(QuestionType.filtered_lookup): {
-        str(ChartType.bar),
-        str(ChartType.horizontal_bar),
-        str(ChartType.kpi_card),
-        str(ChartType.pie),
-    },
-    str(QuestionType.overview): {
-        str(ChartType.line),
-        str(ChartType.area),
-        str(ChartType.bar),
-        str(ChartType.horizontal_bar),
-        str(ChartType.pie),
-        str(ChartType.donut),
-        str(ChartType.histogram),
-        str(ChartType.kpi_card),
-        str(ChartType.scatter),
+    str(QuestionType.trend):        {str(ChartType.line), str(ChartType.area)},
+    str(QuestionType.ranking):      {str(ChartType.bar), str(ChartType.horizontal_bar)},
+    str(QuestionType.comparison):   {str(ChartType.bar), str(ChartType.horizontal_bar)},
+    str(QuestionType.distribution): {str(ChartType.histogram), str(ChartType.bar),
+                                     str(ChartType.pie), str(ChartType.donut)},
+    str(QuestionType.aggregation):  {str(ChartType.kpi_card), str(ChartType.bar),
+                                     str(ChartType.horizontal_bar)},
+    str(QuestionType.correlation):  {str(ChartType.scatter)},
+    str(QuestionType.filtered_lookup): {str(ChartType.bar), str(ChartType.horizontal_bar),
+                                        str(ChartType.kpi_card), str(ChartType.pie)},
+    str(QuestionType.overview):     {
+        str(ChartType.line), str(ChartType.area), str(ChartType.bar),
+        str(ChartType.horizontal_bar), str(ChartType.pie), str(ChartType.donut),
+        str(ChartType.histogram), str(ChartType.kpi_card), str(ChartType.scatter),
     },
 }
 
@@ -129,43 +157,30 @@ def filter_vizs_by_intent(
     visualizations: list[dict[str, Any]],
     intent: QueryIntent,
 ) -> list[dict[str, Any]]:
-    """
-    Keep only charts relevant to the current query intent.
-
-    Rules:
-    - Always preserve the primary chart
-    - For non-overview intents, remove overview charts whose chart_type
-      is not allowed for the detected question_type
-    - If filtering removes everything except the primary chart, that's okay
-    """
+    """Remove charts that don't match the current query intent."""
     if not visualizations:
         return []
 
-    qtype = str(intent.question_type)
+    qtype   = str(intent.question_type)
     allowed = _INTENT_ALLOWED_CHARTS.get(qtype)
-
     if not allowed:
         return visualizations
 
     filtered: list[dict[str, Any]] = []
-
     for idx, viz in enumerate(visualizations):
         chart_type = str(viz.get("chart_type", ""))
-
-        # Always keep first chart if it is the primary analysis result
         if idx == 0 and viz.get("is_primary"):
             filtered.append(viz)
             continue
-
         if chart_type in allowed:
             filtered.append(viz)
 
-    # Safety fallback: if everything got filtered out, keep original first chart
-    if not filtered and visualizations:
-        filtered.append(visualizations[0])
+    return filtered if filtered else (visualizations[:1] if visualizations else [])
 
-    return filtered
 
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 4 — annotation helpers
+# ═══════════════════════════════════════════════════════════════════
 
 def _format_annotations(
     data:    list[dict[str, Any]],
@@ -182,9 +197,9 @@ def _format_annotations(
             continue
         try:
             f = float(y)
-            if metric == MetricType.rate:
+            if metric == str(MetricType.rate):
                 fmt = f"{f * 100:.1f}%"
-            elif metric in (MetricType.count, MetricType.sum):
+            elif metric in (str(MetricType.count), str(MetricType.sum)):
                 fmt = f"{int(f):,}"
             else:
                 fmt = f"{f:.2f}"
@@ -195,10 +210,12 @@ def _format_annotations(
 
 
 def _y_format(metric: str) -> str:
-    return "percent" if metric == MetricType.rate else "number"
+    return "percent" if metric == str(MetricType.rate) else "number"
 
 
-# ── Public API ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 5 — public API
+# ═══════════════════════════════════════════════════════════════════
 
 def reason_visualization(
     intent:         QueryIntent,
@@ -206,15 +223,50 @@ def reason_visualization(
     schema_profile: dict[str, Any],
     is_primary:     bool = False,
 ) -> VizSpec:
+    """
+    Build a VizSpec from a QueryIntent + ExecutionResult.
+
+    KPI results get kpi_card type with properly formatted value.
+    All other results get the appropriate chart type.
+    """
     qt      = str(intent.question_type)
     metric  = str(intent.metric)
     x_field = result.x_field or ""
     y_field = result.y_field or "value"
     data    = result.data
 
-    chart_type  = _select_chart(qt, metric, result.row_count)
-    label_field = x_field if chart_type in (ChartType.pie, ChartType.donut) else None
-    value_field = y_field if chart_type in (ChartType.pie, ChartType.donut) else None
+    # ── KPI path ──────────────────────────────────────────────────
+    kpi = is_kpi_result(result)
+    chart_type = _select_chart(qt, metric, result.row_count, is_kpi=kpi)
+
+    if kpi and data:
+        row = data[0]
+        raw_value  = row.get("value", 0)
+        kpi_label  = row.get("metric", result.metric_label)
+        kpi_value  = _format_kpi_value(raw_value, metric)
+
+        return VizSpec(
+            chart_type=     ChartType.kpi_card,
+            title=          result.result_label,
+            x_field=        "metric",
+            y_field=        "value",
+            data=           data,
+            annotations=    [f"{kpi_label}: {kpi_value}"],
+            y_format=       _y_format(metric),
+            y_axis_label=   result.metric_label,
+            why_this_chart= _CHART_RATIONALE[str(ChartType.kpi_card)],
+            confidence=     0.95,
+            is_primary=     is_primary,
+            formula_spec=   result.metric_label,
+        )
+
+    # ── Chart path ────────────────────────────────────────────────
+    label_field = x_field if chart_type in (
+        str(ChartType.pie), str(ChartType.donut)
+    ) else None
+    value_field = y_field if chart_type in (
+        str(ChartType.pie), str(ChartType.donut)
+    ) else None
     annotations = _format_annotations(data, x_field, y_field, metric)
 
     return VizSpec(
@@ -228,7 +280,7 @@ def reason_visualization(
         annotations=    annotations,
         y_format=       _y_format(metric),
         y_axis_label=   result.metric_label,
-        why_this_chart= _RATIONALE.get(chart_type, ""),
+        why_this_chart= _CHART_RATIONALE.get(str(chart_type), ""),
         confidence=     0.88,
         is_primary=     is_primary,
         formula_spec=   result.metric_label,
@@ -237,9 +289,8 @@ def reason_visualization(
 
 def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
     """
-    Build 2 dashboard layout options from a list of VizSpecs.
-    Layout 1 — Focus: primary chart full-width, supporting below.
-    Layout 2 — Overview: 2×2 equal grid.
+    Build 2 layout options from a list of VizSpecs.
+    Unchanged from v2.
     """
     n = len(viz_specs)
     if n == 0:
@@ -260,8 +311,7 @@ def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
         focus_cells.append(LayoutCell(viz_index=3, col_start=1, col_span=12, row_span=1))
 
     layouts.append(DashboardLayout(
-        layout_id="focus",
-        layout_name="Focus View",
+        layout_id="focus", layout_name="Focus View",
         description="Primary analysis full-width, supporting context below.",
         cells=focus_cells,
     ))
@@ -273,8 +323,7 @@ def build_dashboard_layouts(viz_specs: list[VizSpec]) -> list[DashboardLayout]:
         overview_cells.append(LayoutCell(viz_index=i, col_start=cs, col_span=cspan, row_span=1))
 
     layouts.append(DashboardLayout(
-        layout_id="overview",
-        layout_name="Overview Grid",
+        layout_id="overview", layout_name="Overview Grid",
         description="Equal-weight 2×2 grid for side-by-side comparison.",
         cells=overview_cells,
     ))

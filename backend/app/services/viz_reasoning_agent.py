@@ -127,6 +127,7 @@ def reason_visualization(
     annotations = _format_annotations(data, x_field, y_field, metric)
     y_fmt       = _y_format(metric)
     y_label     = result.metric_label
+    color_theme = intent.color_schema or "default"
 
     return VizSpec(
         chart_type=     chart_type,
@@ -139,6 +140,7 @@ def reason_visualization(
         annotations=    annotations,
         y_format=       y_fmt,
         y_axis_label=   y_label,
+        color_scheme=   color_theme,
         why_this_chart= _RATIONALE.get(chart_type, ""),
         confidence=     0.88,
         is_primary=     is_primary,
