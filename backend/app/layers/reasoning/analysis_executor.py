@@ -1,9 +1,17 @@
 """
 app/layers/reasoning/analysis_executor.py
 ══════════════════════════════════════════════════════════════════════
-Deterministic Pandas executor — moved from services/analysis_executor.py.
-ZERO CHANGES to logic. This layer is the protected execution core.
-Only the module path changed.
+Deterministic Pandas Executor — v2
+
+Change from v1:
+  ① Added scalar_agg operation — the KPI path.
+    scalar_agg computes a single aggregate over a column (or row count)
+    and returns ONE row: {"metric": "<label>", "value": <number>}
+    This enables "total revenue" → {"metric": "Total Revenue", "value": 94328.0}
+    without any grouping.
+
+All other operations are UNCHANGED. The executor remains purely
+deterministic — zero LLM calls.
 ══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -19,6 +27,10 @@ from app.core.models import AnalysisPlan, ExecutionResult
 
 logger = logging.getLogger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 1 — operation handlers
+# ═══════════════════════════════════════════════════════════════════
 
 def _op_filter(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
     col = args["column"]
@@ -48,6 +60,47 @@ def _op_filter(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
         logger.warning("filter: unknown operator '%s', skipping", op)
         return df
     return df[fn(series, val)]
+
+
+def _op_scalar_agg(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
+    """
+    NEW: Compute a single scalar aggregate over the whole dataframe column.
+    Returns a 1-row DataFrame: {"metric": "<label>", "value": <number>}
+
+    This is the KPI path — no grouping, no chart, just a number.
+
+    args:
+      target: column name to aggregate (None → count rows)
+      agg_fn: count | sum | mean | median | max | min
+    """
+    target = args.get("target")
+    agg_fn = args.get("agg_fn", "count")
+
+    if agg_fn == "count" or target is None:
+        result_value = len(df)
+        metric_label = "Row Count"
+    else:
+        if target not in df.columns:
+            raise ValueError(f"scalar_agg: column '{target}' not found in dataframe")
+        numeric = pd.to_numeric(df[target], errors="coerce").dropna()
+        if len(numeric) == 0:
+            raise ValueError(
+                f"scalar_agg: column '{target}' has no numeric values after coercion"
+            )
+        agg_fns = {
+            "sum":    numeric.sum,
+            "mean":   numeric.mean,
+            "median": numeric.median,
+            "max":    numeric.max,
+            "min":    numeric.min,
+        }
+        fn = agg_fns.get(agg_fn)
+        if fn is None:
+            raise ValueError(f"scalar_agg: unsupported agg_fn '{agg_fn}'")
+        result_value = round(float(fn()), 4)
+        metric_label = f"{agg_fn.title()} of {target.replace('_', ' ').title()}"
+
+    return pd.DataFrame([{"metric": metric_label, "value": result_value}])
 
 
 def _op_groupby_agg(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
@@ -127,7 +180,8 @@ def _op_time_resample(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
         try:
             tmp["_dt"] = pd.to_datetime(tmp[date_col], errors="coerce", format="mixed")
         except TypeError:
-            tmp["_dt"] = pd.to_datetime(tmp[date_col], errors="coerce")
+            tmp["_dt"] = pd.to_datetime(tmp[date_col], errors="coerce",
+                                         infer_datetime_format=True)
     tmp = tmp.dropna(subset=["_dt"]).set_index("_dt")
     if not tmp.empty:
         if target and target in tmp.columns and agg_fn != "count":
@@ -143,8 +197,13 @@ def _op_time_resample(df: pd.DataFrame, args: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(columns=[date_col, "value"])
 
 
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 2 — op dispatch table
+# ═══════════════════════════════════════════════════════════════════
+
 _OP_MAP = {
     "filter":        _op_filter,
+    "scalar_agg":    _op_scalar_agg,      # NEW
     "groupby_agg":   _op_groupby_agg,
     "value_counts":  _op_value_counts,
     "sort":          _op_sort,
@@ -153,6 +212,10 @@ _OP_MAP = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 3 — public API
+# ═══════════════════════════════════════════════════════════════════
+
 def execute_plan(plan: AnalysisPlan, df: pd.DataFrame) -> ExecutionResult:
     """Execute an AnalysisPlan deterministically. Never calls LLM."""
     sample_warning: str | None = None
@@ -160,8 +223,8 @@ def execute_plan(plan: AnalysisPlan, df: pd.DataFrame) -> ExecutionResult:
     if len(df) > settings.max_df_rows:
         df = df.sample(n=settings.sample_rows, random_state=42)
         sample_warning = (
-            f"Dataset sampled to {settings.sample_rows:,} rows "
-            f"for performance. Results are statistically representative."
+            f"Dataset sampled to {settings.sample_rows:,} rows for performance. "
+            f"Results are statistically representative."
         )
         logger.warning("execute_plan: df sampled to %d rows", settings.sample_rows)
 
@@ -175,7 +238,9 @@ def execute_plan(plan: AnalysisPlan, df: pd.DataFrame) -> ExecutionResult:
             continue
         try:
             current_df = handler(current_df, op_spec.args)
-            intermediate_counts[f"after_{op_spec.op}_step{op_spec.step}"] = len(current_df)
+            intermediate_counts[
+                f"after_{op_spec.op}_step{op_spec.step}"
+            ] = len(current_df)
         except Exception as exc:
             logger.error("execute_plan: op '%s' failed: %s", op_spec.op, exc)
             return ExecutionResult(
