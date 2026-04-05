@@ -223,6 +223,7 @@ def find_best_metric(
         for col in columns:
             if (col.get("role") == ColumnRole.metric.value
                     and col["name"] not in exclude
-                    and col.get("semantic_hint") == hint):
+                    and col.get("semantic_hint") == hint
+                    and col.get("dtype", "object") not in ("object", "string", "category")):
                 return col["name"]
     return None

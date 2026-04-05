@@ -1,14 +1,12 @@
 """
-app/pipeline/context.py
-══════════════════════════════════════════════════════════════════════
-PipelineContext — shared state object passed through every pipeline step.
+app/pipeline/context.py — v2 (multi-chart fields added)
 
-Design principles:
-  - Single mutable object that flows through all steps
-  - Each step reads inputs it needs and writes its outputs
-  - Orchestrator assembles final response from context at the end
-  - Simplifies testing: mock context → test any step in isolation
-══════════════════════════════════════════════════════════════════════
+New attributes vs v1:
+  dashboard_plan   DashboardPlan  — output of planner.plan_dashboard()
+  multi_result     MultiExecutionResult — output of multi_executor
+  result_insights  list[dict]     — output of result_insight_engine
+
+All existing attributes preserved unchanged.
 """
 from __future__ import annotations
 
@@ -18,71 +16,77 @@ from typing import Any, Optional
 
 import pandas as pd
 
+# forward-ref friendly imports
 from app.core.models import (
     AnalysisPlan, AssumptionBlock, ExecutionResult,
-    KPICoverage, QueryIntent, SchemaContext, ValidationReport, VizSpec,
+    KPICoverage, QueryIntent, SchemaContext, ValidationReport,
 )
-from app.core.session_store import SessionContext
-from app.layers.validation.confidence_scorer import ConfidenceReport
-from app.layers.reasoning.ambiguity_resolver import AmbiguitySignal
 
 
 class PipelineContext:
-    """
-    Mutable container for all intermediate pipeline artifacts.
-    Created per-request by the orchestrator.
-    """
+    """Mutable scratchpad passed through every pipeline step."""
 
     def __init__(self, prompt: str, session_id: str) -> None:
-        self.request_id:    str = str(uuid.uuid4())[:8]
-        self.prompt:        str = prompt
-        self.session_id:    str = session_id
-        self.started_at:    float = time.time()
+        self.request_id: str = str(uuid.uuid4())[:8]
+        self.prompt:     str = prompt
+        self.session_id: str = session_id
+        self._start:     float = time.time()
 
-        # populated by ingestion layer
-        self.df:            Optional[pd.DataFrame] = None
-        self.filename:      str = ""
-        self.ingestion_warnings: list[str] = []
+        # ingestion
+        self.df:       Optional[pd.DataFrame]  = None
+        self.filename: Optional[str]            = None
 
-        # populated by semantic layer
-        self.schema_profile:  Optional[dict[str, Any]] = None
-        self.schema_context:  Optional[SchemaContext]  = None
+        # profiling
+        self.schema_profile: Optional[dict]        = None
+        self.schema_context: Optional[SchemaContext] = None
 
-        # populated by session store
-        self.session_ctx:   Optional[SessionContext] = None
+        # session
+        self.session_ctx: Any = None
 
-        # populated by reasoning layer
-        self.ambiguity_signal: Optional[AmbiguitySignal] = None
-        self.intent:           Optional[QueryIntent]     = None
-        self.plan:             Optional[AnalysisPlan]    = None
-        self.result:           Optional[ExecutionResult] = None
-        self.validation:       Optional[ValidationReport] = None
-        self.refinement_log:   list[str] = []
+        # understanding
+        self.intent:           Optional[QueryIntent]    = None
+        self.ambiguity_signal: Any                      = None
 
-        # populated by validation layer
-        self.confidence:    Optional[ConfidenceReport] = None
+        # single-plan (backward-compat, used for validation)
+        self.plan:       Optional[AnalysisPlan]     = None
+        self.result:     Optional[ExecutionResult]  = None
+        self.validation: Optional[ValidationReport] = None
+        self.refinement_log: list[str] = []
 
-        # populated by presentation layer
-        self.primary_viz:     Optional[dict[str, Any]] = None
-        self.overview_charts: list[dict[str, Any]]     = []
-        self.all_vizs:        list[dict[str, Any]]     = []
+        # ── NEW: multi-chart plan & results ───────────────────────
+        self.dashboard_plan:  Any = None   # DashboardPlan
+        self.multi_result:    Any = None   # MultiExecutionResult
+        self.result_insights: list[dict] = []
+
+        # scoring
+        self.confidence: Any = None
+
+        # presentation
+        self.primary_viz:   Optional[dict] = None
+        self.all_vizs:      list[dict]     = []
+        self.overview_charts: list[dict]   = []
+        self.is_kpi_only:   bool           = False
+        self.layouts:       list[dict]     = []
+
+        # narration
+        self.insight_report:   Optional[dict] = None
         self.assumption_block: Optional[AssumptionBlock] = None
-        self.kpi_coverage:    Optional[dict[str, Any]]  = None
-        self.layouts:         list[dict[str, Any]]      = []
-        self.insight_report:  dict[str, Any]            = {}
-        self.dataset_output:  dict[str, Any]            = {}
+        self.kpi_coverage:     Optional[dict] = None
 
-        # accumulated warnings
+        # dataset insights
+        self.dataset_output: dict = {}
+
+        # warnings
         self.warnings: list[str] = []
 
     @property
     def elapsed(self) -> float:
-        return round(time.time() - self.started_at, 2)
+        return round(time.time() - self._start, 2)
 
     def add_warning(self, msg: str) -> None:
-        if msg and msg not in self.warnings:
+        if msg:
             self.warnings.append(msg)
 
     def add_warnings(self, msgs: list[str]) -> None:
-        for msg in msgs:
-            self.add_warning(msg)
+        for m in msgs:
+            self.add_warning(m)

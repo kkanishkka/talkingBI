@@ -154,6 +154,7 @@ class FilterSpec(BaseModel):
     value:    Any
 
 
+
 class QueryIntent(BaseModel):
     """Output of QueryUnderstandingAgent."""
     question_type:       QuestionType      = QuestionType.overview
@@ -162,6 +163,7 @@ class QueryIntent(BaseModel):
     secondary_dimension: Optional[str]     = None
     target_variable:     Optional[str]     = None
     rate_value:          Optional[str]     = None   # positive class for rate
+    color_schema:        Optional[str]     = None   # requested color/theme
     filters:             list[FilterSpec]  = Field(default_factory=list)
     time_column:         Optional[str]     = None
     time_grain:          Optional[str]     = None   # D, W, M, Q, Y

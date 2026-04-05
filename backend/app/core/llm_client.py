@@ -1,17 +1,28 @@
 """
 app/core/llm_client.py
 ══════════════════════════════════════════════════════════════════════
-Single LLM client implementation used by every agent that needs LLM.
+Single LLM client — v2 (Groq-first)
 
-Supports: OpenAI-compatible APIs, Anthropic.
-Always: returns None on failure so callers fall back to rule-based path.
-Never: raises exceptions that would crash the pipeline.
+Priority order:
+  1. Groq   — fast, cheap, great for structured JSON (llama-3 / mixtral)
+  2. OpenAI — fallback if GROQ_API_KEY not set
+  3. Anthropic — last resort
+
+Config (read from environment / .env file):
+  GROQ_API_KEY     — enables Groq path  ← NEW
+  GROQ_MODEL       — default: llama3-8b-8192
+  OPENAI_API_KEY   — enables OpenAI path
+  OPENAI_API_BASE  — override base URL
+  OPENAI_MODEL     — default: gpt-4o-mini
+  ANTHROPIC_API_KEY— enables Anthropic path
+  ANTHROPIC_MODEL  — default: claude-3-haiku-20240307
+  LLM_MAX_TOKENS   — default: 1200
+  LLM_TEMPERATURE  — default: 0.0
 
 Usage:
-    from app.core.llm_client import llm_client
-    text = llm_client.complete(system_prompt, user_message, json_mode=True)
-    if text is None:
-        # use rule-based fallback
+  from app.core.llm_client import llm_client
+  text = llm_client.complete(system, user, json_mode=True)
+  # returns None on any failure — callers fall back to rule-based path
 ══════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -26,29 +37,23 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """
-    Thin wrapper over OpenAI / Anthropic APIs.
-    Reads configuration from environment variables:
-        OPENAI_API_KEY    — enables OpenAI path
-        OPENAI_API_BASE   — override base URL (Azure, local Ollama, etc.)
-        OPENAI_MODEL      — default: gpt-4o-mini
-        ANTHROPIC_API_KEY — enables Anthropic path
-        ANTHROPIC_MODEL   — default: claude-3-haiku-20240307
-        LLM_MAX_TOKENS    — default: 1000
-        LLM_TEMPERATURE   — default: 0 for structured output, 0.3 for narration
-    """
-
     def __init__(self) -> None:
-        self._openai_key    = os.getenv("OPENAI_API_KEY", "")
-        self._openai_base   = os.getenv("OPENAI_API_BASE")
-        self._openai_model  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self._anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        # Groq
+        self._groq_key   = os.getenv("GROQ_API_KEY", "")
+        self._groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        # OpenAI
+        self._openai_key   = os.getenv("OPENAI_API_KEY", "")
+        self._openai_base  = os.getenv("OPENAI_API_BASE")
+        self._openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        # Anthropic
+        self._anthropic_key   = os.getenv("ANTHROPIC_API_KEY", "")
         self._anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
-        self._max_tokens    = int(os.getenv("LLM_MAX_TOKENS", "1200"))
+        # Shared
+        self._max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1200"))
 
     @property
     def available(self) -> bool:
-        return bool(self._openai_key or self._anthropic_key)
+        return bool(self._groq_key or self._openai_key or self._anthropic_key)
 
     def complete(
         self,
@@ -58,22 +63,24 @@ class LLMClient:
         temperature:   float = 0.0,
         max_tokens:    Optional[int] = None,
     ) -> Optional[str]:
-        """
-        Call the LLM and return raw text response, or None on failure.
-        json_mode=True instructs the model to respond with valid JSON only.
-        """
         tokens = max_tokens or self._max_tokens
 
-        if self._openai_key:
-            return self._openai_complete(
-                system_prompt, user_message, json_mode, temperature, tokens
-            )
-        if self._anthropic_key:
-            return self._anthropic_complete(
-                system_prompt, user_message, json_mode, temperature, tokens
-            )
+        if self._groq_key:
+            result = self._groq_complete(system_prompt, user_message, json_mode, temperature, tokens)
+            if result is not None:
+                return result
+            logger.warning("LLMClient: Groq failed, trying next provider")
 
-        logger.debug("LLMClient: no API key configured, returning None")
+        if self._openai_key:
+            result = self._openai_complete(system_prompt, user_message, json_mode, temperature, tokens)
+            if result is not None:
+                return result
+            logger.warning("LLMClient: OpenAI failed, trying next provider")
+
+        if self._anthropic_key:
+            return self._anthropic_complete(system_prompt, user_message, json_mode, temperature, tokens)
+
+        logger.debug("LLMClient: no API key configured")
         return None
 
     def complete_json(
@@ -82,24 +89,55 @@ class LLMClient:
         user_message:  str,
         temperature:   float = 0.0,
     ) -> Optional[dict[str, Any]]:
-        """
-        Convenience: call LLM, parse JSON, return dict or None.
-        Strips markdown fences before parsing.
-        """
         raw = self.complete(system_prompt, user_message, json_mode=True, temperature=temperature)
         if raw is None:
             return None
         return self._parse_json(raw)
 
+    # ── Groq ──────────────────────────────────────────────────────
+
+    def _groq_complete(
+        self,
+        system:      str,
+        user:        str,
+        json_mode:   bool,
+        temperature: float,
+        max_tokens:  int,
+    ) -> Optional[str]:
+        try:
+            from groq import Groq  # pip install groq
+            client = Groq(api_key=self._groq_key)
+
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ]
+            params: dict[str, Any] = dict(
+                model=self._groq_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            # Groq supports response_format for llama-3 and mixtral models
+            if json_mode:
+                params["response_format"] = {"type": "json_object"}
+
+            resp = client.chat.completions.create(**params)
+            return resp.choices[0].message.content
+
+        except Exception as exc:
+            logger.warning("LLMClient Groq call failed: %s", exc)
+            return None
+
     # ── OpenAI ────────────────────────────────────────────────────
 
     def _openai_complete(
         self,
-        system: str,
-        user:   str,
-        json_mode: bool,
+        system:      str,
+        user:        str,
+        json_mode:   bool,
         temperature: float,
-        max_tokens: int,
+        max_tokens:  int,
     ) -> Optional[str]:
         try:
             from openai import OpenAI
@@ -132,11 +170,11 @@ class LLMClient:
 
     def _anthropic_complete(
         self,
-        system: str,
-        user:   str,
-        json_mode: bool,
+        system:      str,
+        user:        str,
+        json_mode:   bool,
         temperature: float,
-        max_tokens: int,
+        max_tokens:  int,
     ) -> Optional[str]:
         try:
             import anthropic
@@ -169,5 +207,4 @@ class LLMClient:
             return None
 
 
-# ── module-level singleton ────────────────────────────────────────
 llm_client = LLMClient()
